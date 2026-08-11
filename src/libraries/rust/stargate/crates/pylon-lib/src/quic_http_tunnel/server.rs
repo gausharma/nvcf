@@ -123,14 +123,18 @@ pub async fn start_quic_http_tunnel(
         forwarding,
     );
     let task_tracker_for_accept = task_tracker.clone();
+    let mut tls_changes = stargate_tls::change_detector_for_reloaders(
+        server_identity_reloader.as_ref(),
+        None,
+        tls_reload_interval,
+    )
+    .map_err(|source| TunnelError::Tls { source })?;
 
     let accept_task = OwnedTask::spawn("direct tunnel accept loop", move |shutdown| async move {
-        let mut reload_interval = tokio::time::interval(tls_reload_interval);
-        reload_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = reload_interval.tick(), if server_identity_reloader.is_some() => {
+                _ = tls_changes.changed(), if server_identity_reloader.is_some() => {
                     let reloader = server_identity_reloader
                         .as_mut()
                         .expect("TLS reloader branch requires a configured reloader");

@@ -164,7 +164,8 @@ llmRequestRouter:
     audience: ""
 
   tls:
-    # Mounted certificate and key updates are reloaded within 30 seconds.
+    # The mount directory is watched for certificate and key updates.
+    # A five-minute reconciliation poll recovers missed notifications.
     # Keep both files in one Secret so Kubernetes projects one atomic generation.
     secretName: ""
     mountPath: ""

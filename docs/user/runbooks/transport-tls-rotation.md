@@ -4,9 +4,10 @@
 # Rotate Transport TLS Material
 
 Stargate, Pylon, and `stargate-k8s-router` reload mounted TLS files without a
-process restart. A valid replacement becomes active within 30 seconds after
-Kubernetes exposes the complete projected-volume generation. The default poll
-interval is 10 seconds.
+process restart. The services watch the TLS mount directory so a valid
+replacement normally becomes active within 30 seconds after Kubernetes exposes
+the complete projected-volume generation. A five-minute reconciliation poll
+provides recovery when filesystem notifications are unavailable or missed.
 
 Server certificate and private-key files are loaded as one generation. Client
 trust bundles are also validated before activation. An invalid, empty,

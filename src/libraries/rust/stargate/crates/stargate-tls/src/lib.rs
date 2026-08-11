@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use quinn::{ClientConfig, ServerConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -31,8 +32,127 @@ use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 
 const MAX_TLS_MATERIAL_BYTES: u64 = 1024 * 1024;
 
-/// Default polling interval for projected TLS material, below the 30-second reload contract.
-pub const DEFAULT_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(10);
+/// Default reconciliation interval used when filesystem notifications are missed.
+pub const DEFAULT_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(300);
+
+const TLS_WATCH_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// Detects projected TLS material changes through directory notifications with polling fallback.
+pub struct TlsMaterialChangeDetector {
+    watcher: Option<RecommendedWatcher>,
+    events: tokio::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    reconciliation: tokio::time::Interval,
+    pending_change_deadline: Option<tokio::time::Instant>,
+}
+
+impl TlsMaterialChangeDetector {
+    /// Watches the parent directories of `paths` and periodically reconciles as a fallback.
+    pub fn new(paths: &[&Path], reconciliation_interval: Duration) -> Result<Self> {
+        ensure!(
+            !reconciliation_interval.is_zero(),
+            "TLS reload interval must be positive"
+        );
+        let (events_tx, events) = tokio::sync::mpsc::channel(1);
+        let watcher = notify::recommended_watcher(move |event| {
+            let _ = events_tx.try_send(event);
+        });
+        let watcher = match watcher {
+            Ok(mut watcher) => {
+                let mut watched_directories = std::collections::HashSet::new();
+                let mut watch_failed = false;
+                for path in paths {
+                    let parent = path
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."));
+                    if watched_directories.insert(parent.to_path_buf())
+                        && let Err(error) = watcher.watch(parent, RecursiveMode::NonRecursive)
+                    {
+                        tracing::warn!(path = %parent.display(), %error, "failed to watch TLS material directory; using reconciliation polling");
+                        watch_failed = true;
+                        break;
+                    }
+                }
+                (!watch_failed).then_some(watcher)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to create TLS material watcher; using reconciliation polling");
+                None
+            }
+        };
+        let mut reconciliation = tokio::time::interval(reconciliation_interval);
+        reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Ok(Self {
+            watcher,
+            events,
+            reconciliation,
+            pending_change_deadline: None,
+        })
+    }
+
+    /// Waits for a debounced directory notification or the fallback reconciliation interval.
+    pub async fn changed(&mut self) {
+        loop {
+            if let Some(deadline) = self.pending_change_deadline {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => {
+                        self.pending_change_deadline = None;
+                        while let Ok(event) = self.events.try_recv() {
+                            if let Err(error) = event {
+                                tracing::warn!(%error, "TLS material watcher reported an error; reconciliation polling remains active");
+                            }
+                        }
+                        return;
+                    }
+                    event = self.events.recv(), if self.watcher.is_some() => {
+                        self.record_watcher_event(event);
+                    }
+                }
+                continue;
+            }
+            tokio::select! {
+                _ = self.reconciliation.tick() => return,
+                event = self.events.recv(), if self.watcher.is_some() => {
+                    self.record_watcher_event(event);
+                }
+            }
+        }
+    }
+
+    fn record_watcher_event(&mut self, event: Option<notify::Result<notify::Event>>) {
+        match event {
+            Some(Ok(_)) => {
+                self.pending_change_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + TLS_WATCH_DEBOUNCE);
+            }
+            Some(Err(error)) => {
+                tracing::warn!(%error, "TLS material watcher reported an error; reconciliation polling remains active");
+                self.pending_change_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + TLS_WATCH_DEBOUNCE);
+            }
+            None => {
+                tracing::warn!("TLS material watcher stopped; using reconciliation polling");
+                self.watcher = None;
+            }
+        }
+    }
+}
+
+/// Creates one detector for every configured server-identity and client-trust path.
+pub fn change_detector_for_reloaders(
+    server_identity: Option<&ServerIdentityReloader>,
+    client_trust: Option<&ClientTrustReloader>,
+    reconciliation_interval: Duration,
+) -> Result<TlsMaterialChangeDetector> {
+    let mut paths = Vec::new();
+    if let Some(reloader) = server_identity {
+        paths.extend([reloader.cert_path.as_path(), reloader.key_path.as_path()]);
+    }
+    if let Some(reloader) = client_trust {
+        paths.push(reloader.trust_path.as_path());
+    }
+    TlsMaterialChangeDetector::new(&paths, reconciliation_interval)
+}
 
 /// Generates a PEM self-signed certificate and key with SANs for `localhost` and `stargate`.
 pub fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>)> {
@@ -177,6 +297,14 @@ impl ClientTrustReloader {
         ))
     }
 
+    /// Creates a directory watcher with periodic reconciliation for this trust bundle.
+    pub fn change_detector(
+        &self,
+        reconciliation_interval: Duration,
+    ) -> Result<TlsMaterialChangeDetector> {
+        TlsMaterialChangeDetector::new(&[&self.trust_path], reconciliation_interval)
+    }
+
     /// Validates and publishes a changed trust bundle.
     pub fn reload_if_changed(&mut self) -> Result<bool> {
         let Some(candidate) = self.load_candidate()? else {
@@ -227,6 +355,14 @@ impl ServerIdentityReloader {
             current,
             last_rejected_fingerprint: None,
         })
+    }
+
+    /// Creates a directory watcher with periodic reconciliation for this identity pair.
+    pub fn change_detector(
+        &self,
+        reconciliation_interval: Duration,
+    ) -> Result<TlsMaterialChangeDetector> {
+        TlsMaterialChangeDetector::new(&[&self.cert_path, &self.key_path], reconciliation_interval)
     }
 
     /// Returns the active last-known-good identity.
@@ -579,24 +715,19 @@ fn read_trust_bundle(path: &Path) -> Result<Vec<u8>> {
     Ok(trust_pem)
 }
 
-/// Polls projected certificate and key files and updates new QUIC handshakes in place.
+/// Watches projected certificate and key files and updates new QUIC handshakes in place.
 pub async fn run_quic_server_identity_reloader(
     mut reloader: ServerIdentityReloader,
     endpoint: quinn::Endpoint,
     alpn_protocols: Vec<Vec<u8>>,
-    poll_interval: Duration,
+    reconciliation_interval: Duration,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    ensure!(
-        !poll_interval.is_zero(),
-        "TLS reload interval must be positive"
-    );
-    let mut interval = tokio::time::interval(poll_interval);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut changes = reloader.change_detector(reconciliation_interval)?;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
-            _ = interval.tick() => {
+            _ = changes.changed() => {
                 match reloader.reload_quic_server_config_if_changed(
                     &endpoint,
                     alpn_protocols.clone(),
@@ -619,22 +750,17 @@ pub async fn run_quic_server_identity_reloader(
     }
 }
 
-/// Polls a projected trust-bundle file and publishes valid replacements.
+/// Watches a projected trust-bundle file and publishes valid replacements.
 pub async fn run_client_trust_reloader(
     mut reloader: ClientTrustReloader,
-    poll_interval: Duration,
+    reconciliation_interval: Duration,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    ensure!(
-        !poll_interval.is_zero(),
-        "TLS reload interval must be positive"
-    );
-    let mut interval = tokio::time::interval(poll_interval);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut changes = reloader.change_detector(reconciliation_interval)?;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
-            _ = interval.tick() => {
+            _ = changes.changed() => {
                 match reloader.reload_if_changed() {
                     Ok(true) => tracing::info!(
                         material_type = "client_trust",
@@ -965,17 +1091,17 @@ mod tests {
             reloader,
             server.clone(),
             Vec::new(),
-            std::time::Duration::from_millis(10),
+            std::time::Duration::from_secs(60),
             shutdown.clone(),
         ));
 
         install_projected_generation(root.path(), "..2026_bad", &second_cert, &first_key);
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         connect_with_trust(&server, &first_cert).await?;
         assert!(connect_with_trust(&server, &second_cert).await.is_err());
 
         install_projected_generation(root.path(), "..2026_02", &second_cert, &second_key);
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if connect_with_trust(&server, &second_cert).await.is_ok() {
                     break;
@@ -1023,6 +1149,80 @@ mod tests {
 
         shutdown.cancel();
         watcher.await??;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_trust_directory_event_beats_slow_reconciliation_poll() -> Result<()> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let root = TestDir::new();
+        let (first_cert, _) = generate_self_signed_cert().unwrap();
+        let (second_cert, _) = generate_self_signed_cert().unwrap();
+        install_projected_trust_generation(root.path(), "..2026_01", &first_cert);
+
+        let (reloader, provider) = ClientTrustReloader::load(root.path().join("ca.crt"))?;
+        let mut updates = provider.subscribe();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let watcher = tokio::spawn(run_client_trust_reloader(
+            reloader,
+            Duration::from_secs(60),
+            shutdown.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        install_projected_trust_generation(root.path(), "..2026_02", &second_cert);
+
+        tokio::time::timeout(Duration::from_secs(5), updates.changed())
+            .await
+            .context("directory event did not trigger trust reload before fallback poll")??;
+        assert_eq!(provider.current_pem(), second_cert);
+
+        shutdown.cancel();
+        watcher.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn change_detector_reconciles_when_directory_watch_is_unavailable() -> Result<()> {
+        let root = TestDir::new();
+        let missing_material = root.path().join("missing").join("tls.crt");
+        let mut detector =
+            TlsMaterialChangeDetector::new(&[&missing_material], Duration::from_millis(20))?;
+
+        detector.changed().await;
+        tokio::time::timeout(Duration::from_secs(1), detector.changed())
+            .await
+            .context("fallback reconciliation did not run")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn change_detector_retains_event_when_debounce_wait_is_cancelled() -> Result<()> {
+        let (events_tx, events) = tokio::sync::mpsc::channel(1);
+        let watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {})?;
+        let mut reconciliation = tokio::time::interval(Duration::from_secs(60));
+        reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut detector = TlsMaterialChangeDetector {
+            watcher: Some(watcher),
+            events,
+            reconciliation,
+            pending_change_deadline: None,
+        };
+
+        detector.changed().await;
+        events_tx
+            .send(Ok(notify::Event::new(notify::EventKind::Any)))
+            .await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), detector.changed())
+                .await
+                .is_err(),
+            "the first wait should be cancelled during debounce"
+        );
+        tokio::time::timeout(Duration::from_secs(1), detector.changed())
+            .await
+            .context("cancelled debounce discarded the pending directory event")?;
         Ok(())
     }
 

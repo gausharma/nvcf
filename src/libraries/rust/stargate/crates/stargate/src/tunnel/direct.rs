@@ -138,19 +138,14 @@ impl QuicHttpProxy {
     pub(crate) async fn run_client_trust_reloader(
         self: Arc<Self>,
         mut reloader: stargate_tls::ClientTrustReloader,
-        poll_interval: Duration,
+        reconciliation_interval: Duration,
         shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
-        ensure!(
-            !poll_interval.is_zero(),
-            "TLS reload interval must be positive"
-        );
-        let mut interval = tokio::time::interval(poll_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut changes = reloader.change_detector(reconciliation_interval)?;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
-                _ = interval.tick() => {
+                _ = changes.changed() => {
                     match reloader.load_candidate() {
                         Ok(None) => {}
                         Ok(Some(candidate)) => {

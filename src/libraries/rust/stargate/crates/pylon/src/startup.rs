@@ -221,7 +221,7 @@ struct RunningPylon {
     registration_client: InferenceServerRegistrationClient,
     registration_config: Option<InferenceServerRegistrationConfig>,
     tls_trust_reloader: Option<stargate_tls::ClientTrustReloader>,
-    tls_reload_interval: Option<tokio::time::Interval>,
+    tls_reload_changes: Option<stargate_tls::TlsMaterialChangeDetector>,
     metrics: Arc<PylonMetrics>,
     engine_stats_stream: Option<RunningEngineStatsStream>,
     stats_collector: StatsCollectorHandle,
@@ -255,8 +255,8 @@ impl RunningPylon {
                 }
                 result = self.registration_client.wait_for_exit() => critical_task_exit_error("registration session", result),
                 _ = async {
-                    match self.tls_reload_interval.as_mut() {
-                        Some(interval) => interval.tick().await,
+                    match self.tls_reload_changes.as_mut() {
+                        Some(changes) => changes.changed().await,
                         None => std::future::pending().await,
                     }
                 } => {
@@ -414,7 +414,7 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
     } else {
         None
     };
-    let (tls_trust_reloader, tls_reload_interval, client_trust_pem) =
+    let (tls_trust_reloader, tls_reload_changes, client_trust_pem) =
         if plan.backend_tunnel.is_reverse() && !args.quic_insecure {
             let trust_path = args
                 .tls_cert_path
@@ -423,9 +423,8 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
             let (reloader, _) = stargate_tls::ClientTrustReloader::load(trust_path.into())
                 .context("load initial Pylon TLS client trust")?;
             let current_pem = reloader.current_pem().to_vec();
-            let mut interval = tokio::time::interval(stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            (Some(reloader), Some(interval), Some(current_pem))
+            let changes = reloader.change_detector(stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL)?;
+            (Some(reloader), Some(changes), Some(current_pem))
         } else {
             (None, None, None)
         };
@@ -489,7 +488,7 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
         registration_client,
         registration_config: Some(registration_config),
         tls_trust_reloader,
-        tls_reload_interval,
+        tls_reload_changes,
         metrics,
         engine_stats_stream,
         stats_collector,
@@ -1118,7 +1117,7 @@ mod tests {
             registration_client: InferenceServerRegistrationClient::default(),
             registration_config: None,
             tls_trust_reloader: None,
-            tls_reload_interval: None,
+            tls_reload_changes: None,
             metrics: metrics.clone(),
             engine_stats_stream: None,
             stats_collector,

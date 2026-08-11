@@ -140,15 +140,18 @@ impl WebTransportRouterRuntime {
         {
             metrics.set_tls_certificate_expiry(validity.not_after_unix_seconds);
         }
-        let mut reload_interval = tokio::time::interval(self.tls_reload_interval);
-        reload_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut reload_changes = stargate_tls::change_detector_for_reloaders(
+            server_identity_reloader.as_ref(),
+            client_trust_reloader.as_ref(),
+            self.tls_reload_interval,
+        )?;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     self.endpoint.close(0u32.into(), b"shutdown");
                     return Ok(());
                 }
-                _ = reload_interval.tick(), if server_identity_reloader.is_some() || client_trust_reloader.is_some() => {
+                _ = reload_changes.changed(), if server_identity_reloader.is_some() || client_trust_reloader.is_some() => {
                     if let Some(reloader) = server_identity_reloader.as_mut() {
                         match reloader.load_candidate() {
                             Ok(Some(identity)) => {

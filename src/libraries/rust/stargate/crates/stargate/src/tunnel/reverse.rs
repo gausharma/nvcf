@@ -158,15 +158,14 @@ impl QuicHttpProxy {
         if let Some(mut reloader) = self.config.server_identity_reloader.clone() {
             let reload_endpoint = endpoint.clone();
             let alpn_protocols = self.config.tunnel_protocol.alpn_protocols();
-            let reload_interval = self.config.tls_reload_interval;
+            let reconciliation_interval = self.config.tls_reload_interval;
             let proxy = self.clone();
             tasks.spawn_critical("TLS server identity reloader", move |stop| async move {
-                let mut interval = tokio::time::interval(reload_interval);
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut changes = reloader.change_detector(reconciliation_interval)?;
                 loop {
                     tokio::select! {
                         _ = stop.cancelled() => return Ok(()),
-                        _ = interval.tick() => {
+                        _ = changes.changed() => {
                             match reloader.load_candidate() {
                                 Ok(Some(identity)) => {
                                     let activation = (|| -> Result<_> {
@@ -224,15 +223,14 @@ impl QuicHttpProxy {
         if let Some(mut reloader) = self.config.client_trust_reloader.clone() {
             let reload_endpoints = relay_endpoints.clone();
             let tunnel_protocol = self.config.tunnel_protocol;
-            let poll_interval = self.config.tls_reload_interval;
+            let reconciliation_interval = self.config.tls_reload_interval;
             let proxy = self.clone();
             tasks.spawn_critical("TLS relay trust reloader", move |shutdown| async move {
-                let mut interval = tokio::time::interval(poll_interval);
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut changes = reloader.change_detector(reconciliation_interval)?;
                 loop {
                     tokio::select! {
                         _ = shutdown.cancelled() => return Ok(()),
-                        _ = interval.tick() => {
+                        _ = changes.changed() => {
                             match reloader.load_candidate() {
                                 Ok(Some(candidate)) => {
                                     let activation = (|| -> Result<_> {
