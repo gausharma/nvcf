@@ -102,6 +102,7 @@ define_stargate_metrics! {
         admission_rejections_total("admission_rejections_total", "Total number of requests rejected by local admission control", ["routing_key", "model", "reason"]);
         quic_connection_evictions_total("quic_connection_evictions_total", "Total number of QUIC connection pool evictions", ["inference_server_id", "reason"]);
         quic_hot_path_reconnect_total("quic_hot_path_reconnect_total", "Total number of direct QUIC reconnects attempted on the proxy hot path", ["inference_server_id", "result"]);
+        tls_reloads_total("tls_reloads_total", "TLS material reload attempts by material type and result", ["material_type", "result"]);
     }
     histograms {
         proxy_replay_buffer_bytes("proxy_replay_buffer_bytes", "Bytes currently retained for proxied request body replay", ["model"], [0.0, 1024.0, 4096.0, 16_384.0, 65_536.0, 262_144.0, 1_048_576.0, 4_194_304.0, 16_777_216.0, 67_108_864.0]);
@@ -110,6 +111,7 @@ define_stargate_metrics! {
     }
     gauges {
         active_inference_servers("active_inference_servers", "Active inference servers available for a routing target", ["routing_key", "model"]);
+        tls_certificate_expiry_seconds("tls_certificate_expiry_seconds", "Unix timestamp when the active TLS certificate expires", ["material_type"]);
     }
 }
 
@@ -138,7 +140,20 @@ impl StargateMetrics {
     }
 
     pub fn new_with_prefix(prefix: &str) -> anyhow::Result<Arc<Self>> {
-        Self::register(prefix).map(Arc::new)
+        let metrics = Arc::new(Self::register(prefix)?);
+        for material_type in ["server_identity", "client_trust"] {
+            for result in ["success", "rejected"] {
+                metrics
+                    .tls_reloads_total
+                    .with_label_values(&[material_type, result])
+                    .inc_by(0);
+            }
+        }
+        metrics
+            .tls_certificate_expiry_seconds
+            .with_label_values(&["server_identity"])
+            .set(0);
+        Ok(metrics)
     }
 
     pub fn registry(&self) -> Arc<Registry> {
@@ -157,6 +172,7 @@ impl StargateMetrics {
         GenericCounter<AtomicU64>, admission_rejections_total(routing_key: Option<&str>, model: &str, reason: &str) => [routing_key.unwrap_or(""), model, reason];
         GenericCounter<AtomicU64>, quic_connection_evictions_total(inference_server_id: &str, reason: &str) => [inference_server_id, reason];
         GenericCounter<AtomicU64>, quic_hot_path_reconnect_total(inference_server_id: &str, result: &str) => [inference_server_id, result];
+        GenericCounter<AtomicU64>, tls_reloads_total(material_type: &str, result: &str) => [material_type, result];
         Histogram, proxy_replay_buffer_bytes(model: &str) => [model];
         Histogram, proxy_duration_seconds(routing_key: Option<&str>, model: &str, inference_server_id: &str) => [routing_key.unwrap_or(""), model, inference_server_id];
         Histogram, routing_duration_seconds(routing_key: Option<&str>, model: &str) => [routing_key.unwrap_or(""), model];
@@ -172,6 +188,12 @@ impl StargateMetrics {
         self.active_inference_servers
             .with_label_values(&[routing_key.unwrap_or(""), model])
             .set(count.try_into().unwrap_or(i64::MAX));
+    }
+
+    pub fn set_tls_certificate_expiry(&self, unix_seconds: i64) {
+        self.tls_certificate_expiry_seconds
+            .with_label_values(&["server_identity"])
+            .set(unix_seconds);
     }
 }
 
@@ -295,5 +317,25 @@ mod tests {
             body.contains("stargate_requests_total"),
             "default stargate requests counter missing:\n{body}"
         );
+    }
+
+    #[test]
+    fn tls_reload_metrics_are_preinitialized() {
+        let metrics = StargateMetrics::new().expect("metrics should initialize");
+        metrics
+            .tls_reloads_total("server_identity", "success")
+            .inc();
+        metrics.set_tls_certificate_expiry(1_800_000_000);
+        let body = metrics.gather_text().expect("metrics should encode");
+
+        assert!(body.contains(
+            r#"stargate_tls_reloads_total{material_type="server_identity",result="success"} 1"#
+        ));
+        assert!(body.contains(
+            r#"stargate_tls_reloads_total{material_type="client_trust",result="rejected"} 0"#
+        ));
+        assert!(body.contains(
+            r#"stargate_tls_certificate_expiry_seconds{material_type="server_identity"} 1800000000"#
+        ));
     }
 }

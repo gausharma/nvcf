@@ -48,6 +48,14 @@ pub struct RelayEndpoints {
 }
 
 impl RelayEndpoints {
+    /// Closes all active relay connections owned by these endpoints.
+    pub fn close(&self, reason: &[u8]) {
+        self.endpoint_v4.close(0u32.into(), reason);
+        if let Ok(endpoint) = &self.endpoint_v6 {
+            endpoint.close(0u32.into(), reason);
+        }
+    }
+
     fn endpoint_for_resolved_addrs(
         &self,
         addrs: impl IntoIterator<Item = SocketAddr>,

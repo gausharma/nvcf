@@ -20,7 +20,7 @@ use tokio_util::task::TaskTracker;
 
 use stargate_protocol::TunnelTransportProtocol;
 use stargate_runtime::{OwnedTask, TASK_SHUTDOWN_TIMEOUT};
-use stargate_tls::ServerTlsIdentity;
+use stargate_tls::{DEFAULT_TLS_RELOAD_INTERVAL, ServerIdentityReloader, ServerTlsIdentity};
 
 use super::core::{TunnelForwardingConfig, TunnelServerApp};
 use super::endpoint::{TunnelError, ensure_rustls_provider, make_server_config};
@@ -36,6 +36,8 @@ pub struct QuicHttpTunnelConfig {
     pub forwarding: TunnelForwardingConfig,
     pub tls_cert_pem: Option<Vec<u8>>,
     pub tls_key_pem: Option<Vec<u8>>,
+    pub server_identity_reloader: Option<ServerIdentityReloader>,
+    pub tls_reload_interval: std::time::Duration,
     pub tunnel_protocol: TunnelTransportProtocol,
 }
 
@@ -48,6 +50,8 @@ impl QuicHttpTunnelConfig {
             forwarding: TunnelForwardingConfig::default(),
             tls_cert_pem: None,
             tls_key_pem: None,
+            server_identity_reloader: None,
+            tls_reload_interval: DEFAULT_TLS_RELOAD_INTERVAL,
             tunnel_protocol: TunnelTransportProtocol::RawQuic,
         }
     }
@@ -90,10 +94,19 @@ pub async fn start_quic_http_tunnel(
         forwarding,
         tls_cert_pem,
         tls_key_pem,
+        mut server_identity_reloader,
+        tls_reload_interval,
         tunnel_protocol,
     } = config;
     let tls_identity = ServerTlsIdentity::from_optional_pem(tls_cert_pem, tls_key_pem)
         .map_err(|source| TunnelError::Tls { source })?;
+    let metrics = forwarding.metrics.clone();
+    if let Some(validity) = stargate_tls::server_identity_effective_validity(&tls_identity)
+        .map_err(|source| TunnelError::Tls { source })?
+        && let Some(metrics) = &metrics
+    {
+        metrics.set_tls_certificate_expiry(validity.not_after_unix_seconds);
+    }
     let server_config = make_server_config(&tls_identity, tunnel_protocol)
         .map_err(|source| TunnelError::Tls { source })?;
     let endpoint = Endpoint::server(server_config, listen_addr).map_err(TunnelError::Bind)?;
@@ -112,9 +125,68 @@ pub async fn start_quic_http_tunnel(
     let task_tracker_for_accept = task_tracker.clone();
 
     let accept_task = OwnedTask::spawn("direct tunnel accept loop", move |shutdown| async move {
+        let mut reload_interval = tokio::time::interval(tls_reload_interval);
+        reload_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
+                _ = reload_interval.tick(), if server_identity_reloader.is_some() => {
+                    let reloader = server_identity_reloader
+                        .as_mut()
+                        .expect("TLS reloader branch requires a configured reloader");
+                    match reloader.reload_quic_server_config_if_changed(
+                        &endpoint_for_task,
+                        tunnel_protocol.alpn_protocols(),
+                    ) {
+                        Ok(true) => {
+                            let validity = stargate_tls::server_identity_effective_validity(
+                                reloader.current_identity(),
+                            )
+                            .ok()
+                            .flatten();
+                            if let Some(metrics) = &metrics {
+                                metrics.observe_tls_reload("server_identity", "success");
+                                if let Some(validity) = validity {
+                                    metrics.set_tls_certificate_expiry(
+                                        validity.not_after_unix_seconds,
+                                    );
+                                }
+                            }
+                            tracing::info!(
+                                component = "pylon",
+                                material_type = "server_identity",
+                                result = "success",
+                                not_before_unix_seconds = validity.map_or(0, |value| value.not_before_unix_seconds),
+                                not_after_unix_seconds = validity.map_or(0, |value| value.not_after_unix_seconds),
+                                "TLS material reloaded"
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            if let Some(metrics) = &metrics {
+                                metrics.observe_tls_reload("server_identity", "rejected");
+                            }
+                            tracing::warn!(
+                                component = "pylon",
+                                material_type = "server_identity",
+                                result = "rejected",
+                                error = %error,
+                                "TLS material reload rejected; retaining last-known-good configuration"
+                            );
+                        }
+                    }
+                    if let Err(error) = stargate_tls::validate_server_identity_time(
+                        reloader.current_identity(),
+                    ) {
+                        tracing::error!(
+                            component = "pylon",
+                            material_type = "server_identity",
+                            error = %error,
+                            "active TLS server identity is no longer valid"
+                        );
+                        break;
+                    }
+                }
                 incoming = endpoint_for_task.accept() => {
                     let Some(incoming) = incoming else {
                         break;

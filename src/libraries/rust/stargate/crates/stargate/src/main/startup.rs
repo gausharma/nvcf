@@ -28,7 +28,9 @@ use stargate::runtime::{
 };
 use stargate_forwarding::{ForwardingResolver, HeadlessDnsResolver, render_hostname};
 use stargate_protocol::BackendConnectivity;
-use stargate_tls::ServerTlsIdentity;
+use stargate_tls::{
+    ClientTrustReloader, DEFAULT_TLS_RELOAD_INTERVAL, ServerIdentityReloader, ServerTlsIdentity,
+};
 
 use super::Args;
 
@@ -97,18 +99,47 @@ fn validate_backend_connectivity_args(args: &Args) -> Result<()> {
 
 pub(super) fn proxy_transport_config_from_args(args: &Args) -> Result<ProxyTransportConfig> {
     let retry = proxy_retry_config_from_args(args)?;
-    let tls_cert_pem = args.tls_cert_path.as_ref().map(std::fs::read).transpose()?;
-    let tls_key_pem = args.tls_key_path.as_ref().map(std::fs::read).transpose()?;
+    let server_identity_reloader = if args.reverse_tunnel_listen_addr.is_some() {
+        match (&args.tls_cert_path, &args.tls_key_path) {
+            (Some(cert_path), Some(key_path)) => Some(ServerIdentityReloader::load(
+                cert_path.into(),
+                key_path.into(),
+            )?),
+            (None, None) => None,
+            (Some(_), None) => {
+                anyhow::bail!("TLS key path is required when TLS cert path is provided")
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("TLS cert path is required when TLS key path is provided")
+            }
+        }
+    } else {
+        None
+    };
+    let client_trust_reloader = if args.quic_insecure {
+        None
+    } else {
+        args.tls_cert_path
+            .as_ref()
+            .map(|path| ClientTrustReloader::load(path.into()).map(|(reloader, _)| reloader))
+            .transpose()?
+    };
+    let tls_cert_pem = client_trust_reloader
+        .as_ref()
+        .map(|reloader| reloader.current_pem().to_vec());
     Ok(ProxyTransportConfig {
         quic: QuicTunnelConfig {
             connect_timeout: Duration::from_millis(args.quic_connect_timeout_ms),
             request_timeout: Duration::from_millis(args.quic_request_timeout_ms),
-            server_tls_identity: if args.reverse_tunnel_listen_addr.is_some() {
-                ServerTlsIdentity::from_optional_pem(tls_cert_pem.clone(), tls_key_pem)?
+            server_tls_identity: if let Some(reloader) = &server_identity_reloader {
+                reloader.current_identity().clone()
             } else {
                 ServerTlsIdentity::SelfSigned
             },
+            server_identity_reloader,
+            tls_reload_interval: DEFAULT_TLS_RELOAD_INTERVAL,
             tls_cert_pem,
+            client_trust_reloader,
             quic_insecure: args.quic_insecure,
             tunnel_protocol: args.tunnel_protocol,
             direct_quic_connections: args.direct_quic_connections,

@@ -2344,6 +2344,7 @@ dependencies = [
  "stargate-protocol",
  "stargate-runtime",
  "stargate-telemetry",
+ "stargate-tls",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -3412,6 +3413,9 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

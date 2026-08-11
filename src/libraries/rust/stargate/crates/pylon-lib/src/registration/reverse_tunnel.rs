@@ -157,6 +157,7 @@ pub(super) fn reverse_quic_tunnel_config(
         upstream_http_base_url: config.inference_server_url.clone(),
         forwarding: config.forwarding.clone(),
         tls_cert_pem: config.tls_cert_pem.clone(),
+        client_trust_provider: None,
         quic_insecure: config.quic_insecure,
         tunnel_protocol: config.tunnel_protocol,
         sni_override: endpoint.sni_override.clone(),

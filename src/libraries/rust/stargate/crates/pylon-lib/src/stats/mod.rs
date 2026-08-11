@@ -51,4 +51,6 @@ pub use engine_stats_stream::{
     parse_engine_stats_line_for_benchmark, start_engine_stats_stream,
 };
 pub(crate) use metrics::CalibrationOutcome;
-pub use metrics::{MetricsServerHandle, PylonMetrics, start_metrics_server};
+pub use metrics::{
+    MetricsServerHandle, PylonMetrics, start_metrics_server, start_metrics_server_with_readiness,
+};

@@ -77,6 +77,8 @@ fn crate_root_exports_tunnel_config_public_api() {
         },
         tls_cert_pem: None,
         tls_key_pem: None,
+        server_identity_reloader: None,
+        tls_reload_interval: stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL,
         tunnel_protocol: TunnelTransportProtocol::RawQuic,
     };
     assert_eq!(
@@ -96,6 +98,7 @@ fn crate_root_exports_tunnel_config_public_api() {
             ..Default::default()
         },
         tls_cert_pem: None,
+        client_trust_provider: None,
         quic_insecure: true,
         tunnel_protocol: TunnelTransportProtocol::Http3,
         sni_override: None,

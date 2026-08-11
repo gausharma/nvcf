@@ -127,8 +127,8 @@ impl InferenceServerRegistrationClient {
     }
 
     pub fn start(&mut self, config: InferenceServerRegistrationConfig) -> Result<(), ClientError> {
-        self.stop();
         let config = config.try_into()?;
+        self.stop();
         self.running = Some(OwnedTask::spawn("registration session", move |stop| {
             run_registration_session(config, stop)
         }));

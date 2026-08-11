@@ -65,7 +65,10 @@ async fn livez() -> StatusCode {
 
 async fn readyz(State(state): State<HealthState>) -> StatusCode {
     let snapshot = state.targets.borrow();
-    if snapshot.is_initialized() && snapshot.ready_count() > 0 {
+    if snapshot.is_initialized()
+        && snapshot.ready_count() > 0
+        && state.metrics.tls_identity_is_ready()
+    {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -91,7 +94,7 @@ mod tests {
     async fn readyz_requires_initialized_nonempty_snapshot() {
         let metrics = Arc::new(RouterMetrics::new().expect("metrics should initialize"));
         let (tx, rx) = watch::channel(TargetSnapshot::default());
-        let router = health_router(rx, metrics);
+        let router = health_router(rx, metrics.clone());
         let ready_request = || {
             Request::builder()
                 .uri("/readyz")
@@ -122,10 +125,18 @@ mod tests {
         }]))
         .expect("ready snapshot should publish");
         let response = router
+            .clone()
             .oneshot(ready_request())
             .await
             .expect("readiness request should succeed");
         assert_eq!(response.status(), StatusCode::OK);
+
+        metrics.set_tls_certificate_expiry(0);
+        let response = router
+            .oneshot(ready_request())
+            .await
+            .expect("readiness request should succeed");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

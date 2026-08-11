@@ -267,6 +267,7 @@ impl StargateRuntime {
         )
         .context("failed to initialize quic proxy")?;
         let quic_proxy = Arc::new(quic_proxy);
+        quic_proxy.set_metrics(metrics.clone());
         let shared_state = Arc::new(StargateState::new_with_metrics(metrics.clone()));
 
         let lb_config = match &self.config.lb_config_path {
@@ -289,6 +290,20 @@ impl StargateRuntime {
         );
 
         let (tasks, critical_failure_rx) = CriticalTaskGroup::new("stargate");
+        if self.reverse_tunnel.is_none()
+            && let Some(reloader) = self
+                .config
+                .proxy_transport
+                .quic
+                .client_trust_reloader
+                .clone()
+        {
+            let proxy = quic_proxy.clone();
+            let poll_interval = self.config.proxy_transport.quic.tls_reload_interval;
+            tasks.spawn_critical("TLS client trust reloader", move |shutdown| {
+                proxy.run_client_trust_reloader(reloader, poll_interval, shutdown)
+            });
+        }
         let (backend_connectivity, reverse_tunnel) = match self.reverse_tunnel {
             Some(reverse_tunnel) => {
                 let registration_config = reverse_tunnel.registration_config();
@@ -504,7 +519,10 @@ mod tests {
                     connect_timeout: Duration::from_secs(5),
                     request_timeout: Duration::from_secs(10),
                     tls_cert_pem: None,
+                    client_trust_reloader: None,
                     server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
+                    server_identity_reloader: None,
+                    tls_reload_interval: stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL,
                     quic_insecure: true,
                     tunnel_protocol: Default::default(),
                     direct_quic_connections: 1,

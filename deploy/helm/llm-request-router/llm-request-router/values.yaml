@@ -164,6 +164,8 @@ llmRequestRouter:
     audience: ""
 
   tls:
+    # Mounted certificate and key updates are reloaded within 30 seconds.
+    # Keep both files in one Secret so Kubernetes projects one atomic generation.
     secretName: ""
     mountPath: ""
     certPath: ""

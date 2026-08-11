@@ -18,7 +18,7 @@ use std::time::Duration;
 use axum::http::{HeaderMap, StatusCode};
 
 use stargate_protocol::TunnelTransportProtocol;
-use stargate_tls::ServerTlsIdentity;
+use stargate_tls::{ClientTrustReloader, ServerIdentityReloader, ServerTlsIdentity};
 
 mod body;
 mod connection;
@@ -42,7 +42,10 @@ pub struct QuicTunnelConfig {
     pub request_timeout: Duration,
     pub direct_quic_connections: usize,
     pub tls_cert_pem: Option<Vec<u8>>,
+    pub client_trust_reloader: Option<ClientTrustReloader>,
     pub server_tls_identity: ServerTlsIdentity,
+    pub server_identity_reloader: Option<ServerIdentityReloader>,
+    pub tls_reload_interval: Duration,
     pub quic_insecure: bool,
     pub tunnel_protocol: TunnelTransportProtocol,
 }

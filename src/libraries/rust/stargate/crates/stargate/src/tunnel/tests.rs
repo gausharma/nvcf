@@ -175,7 +175,10 @@ fn test_quic_proxy_with(
         request_timeout: Duration::from_secs(5),
         direct_quic_connections: 1,
         tls_cert_pem: None,
+        client_trust_reloader: None,
         server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
+        server_identity_reloader: None,
+        tls_reload_interval: stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL,
         quic_insecure: true,
         tunnel_protocol,
     };
@@ -393,6 +396,21 @@ async fn negotiate_alpn(
         .unwrap();
     connection.close(0u32.into(), b"test complete");
     server_task.await.unwrap()
+}
+
+async fn connect_reverse_listener_with_trust(
+    listener_addr: SocketAddr,
+    cert_pem: &[u8],
+) -> anyhow::Result<()> {
+    let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap())?;
+    client.set_default_client_config(build_client_config(
+        Some(cert_pem),
+        false,
+        TunnelTransportProtocol::RawQuic,
+    )?);
+    let connection = client.connect(listener_addr, "stargate")?.await?;
+    connection.close(0u32.into(), b"test complete");
+    Ok(())
 }
 
 async fn assert_tunnel_alpn(tunnel_protocol: TunnelTransportProtocol, expected: Option<Vec<u8>>) {
@@ -1708,6 +1726,153 @@ async fn reverse_tunnel_works_with_secure_client_and_provided_cert() {
 
     handle.shutdown().await;
     runtime.begin_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reverse_listener_reloads_projected_server_identity() {
+    install_crypto_provider();
+    let (first_cert, first_key) = stargate_tls::generate_self_signed_cert().unwrap();
+    let (second_cert, second_key) = stargate_tls::generate_self_signed_cert().unwrap();
+    let tls_dir = tempfile::tempdir().unwrap();
+    let cert_path = tls_dir.path().join("tls.crt");
+    let key_path = tls_dir.path().join("tls.key");
+    std::fs::write(&cert_path, &first_cert).unwrap();
+    std::fs::write(&key_path, &first_key).unwrap();
+
+    let state = Arc::new(StargateState::new());
+    let proxy = test_quic_proxy_with(Default::default(), |config| {
+        config.tls_cert_pem = Some(first_cert.clone());
+        config.server_tls_identity = stargate_tls::ServerTlsIdentity::Provided {
+            cert_pem: first_cert.clone(),
+            key_pem: first_key,
+        };
+        config.server_identity_reloader = Some(
+            stargate_tls::ServerIdentityReloader::load(cert_path.clone(), key_path.clone())
+                .unwrap(),
+        );
+        config.tls_reload_interval = Duration::from_millis(10);
+        config.quic_insecure = false;
+    });
+    let (runtime, _failures) = CriticalTaskGroup::new("stargate test");
+    let addr = proxy
+        .start_reverse_listener(
+            state,
+            runtime.clone(),
+            None,
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        )
+        .await
+        .unwrap();
+
+    connect_reverse_listener_with_trust(addr, &first_cert)
+        .await
+        .unwrap();
+    std::fs::write(&cert_path, &second_cert).unwrap();
+    std::fs::write(&key_path, &second_key).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if connect_reverse_listener_with_trust(addr, &second_cert)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Stargate did not activate the replacement identity");
+    assert!(
+        connect_reverse_listener_with_trust(addr, &first_cert)
+            .await
+            .is_err(),
+        "new handshakes must stop presenting the replaced identity"
+    );
+
+    runtime.begin_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_client_reloads_trust_and_closes_existing_connections() {
+    install_crypto_provider();
+    let (first_cert, first_key) = stargate_tls::generate_self_signed_cert().unwrap();
+    let (second_cert, second_key) = stargate_tls::generate_self_signed_cert().unwrap();
+    let tls_dir = tempfile::tempdir().unwrap();
+    let trust_path = tls_dir.path().join("ca.crt");
+    std::fs::write(&trust_path, &first_cert).unwrap();
+    let (reloader, _) = stargate_tls::ClientTrustReloader::load(trust_path.clone()).unwrap();
+    let proxy = test_quic_proxy_with(Default::default(), |config| {
+        config.tls_cert_pem = Some(first_cert.clone());
+        config.quic_insecure = false;
+    });
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let watcher = tokio::spawn(proxy.clone().run_client_trust_reloader(
+        reloader,
+        Duration::from_millis(10),
+        shutdown.clone(),
+    ));
+
+    let first_server = Endpoint::server(
+        stargate_tls::build_quic_server_config(
+            &stargate_tls::ServerTlsIdentity::Provided {
+                cert_pem: first_cert,
+                key_pem: first_key,
+            },
+            Vec::new(),
+        )
+        .unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
+    let first_accept_endpoint = first_server.clone();
+    let first_accept =
+        tokio::spawn(async move { first_accept_endpoint.accept().await.unwrap().await.unwrap() });
+    let first_connection = proxy
+        .connect_direct_connection(&format!("quic://{}", first_server.local_addr().unwrap()))
+        .await
+        .unwrap();
+    let _first_server_connection = first_accept.await.unwrap();
+    assert!(first_connection.is_healthy());
+
+    std::fs::write(&trust_path, &second_cert).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while first_connection.is_healthy() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("trust replacement did not close the old connection");
+
+    let second_server = Endpoint::server(
+        stargate_tls::build_quic_server_config(
+            &stargate_tls::ServerTlsIdentity::Provided {
+                cert_pem: second_cert,
+                key_pem: second_key,
+            },
+            Vec::new(),
+        )
+        .unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
+    let second_accept_endpoint = second_server.clone();
+    let second_accept = tokio::spawn(async move {
+        second_accept_endpoint
+            .accept()
+            .await
+            .unwrap()
+            .await
+            .unwrap()
+    });
+    let second_connection = proxy
+        .connect_direct_connection(&format!("quic://{}", second_server.local_addr().unwrap()))
+        .await
+        .unwrap();
+    let _second_server_connection = second_accept.await.unwrap();
+    assert!(second_connection.is_healthy());
+
+    shutdown.cancel();
+    watcher.await.unwrap().unwrap();
 }
 
 #[tokio::test]

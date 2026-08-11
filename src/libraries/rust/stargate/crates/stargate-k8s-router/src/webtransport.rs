@@ -15,6 +15,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -58,20 +59,28 @@ pub struct WebTransportRouterConfig {
     pub relay_keep_alive_interval: Option<Duration>,
     pub tls_cert_pem: Option<Vec<u8>>,
     pub tls_key_pem: Option<Vec<u8>>,
+    pub server_identity_reloader: Option<stargate_tls::ServerIdentityReloader>,
     pub upstream_tls_cert_pem: Option<Vec<u8>>,
+    pub client_trust_reloader: Option<stargate_tls::ClientTrustReloader>,
+    pub tls_reload_interval: Duration,
     pub quic_insecure: bool,
 }
 
 struct WebTransportRouterRuntimeConfig {
     connect_timeout: Duration,
     hostname_matcher: Option<HostnameMatcher>,
-    upstream_client_config: ClientConfig,
+    upstream_client_config: RwLock<ClientConfig>,
+    trust_generation: watch::Sender<u64>,
 }
 
 struct WebTransportRouterRuntime {
     endpoint: Endpoint,
     bound_addr: SocketAddr,
     config: Arc<WebTransportRouterRuntimeConfig>,
+    relay_config: RelayEndpointConfig,
+    server_identity_reloader: Option<stargate_tls::ServerIdentityReloader>,
+    client_trust_reloader: Option<stargate_tls::ClientTrustReloader>,
+    tls_reload_interval: Duration,
 }
 
 impl WebTransportRouterRuntime {
@@ -93,19 +102,25 @@ impl WebTransportRouterRuntime {
         let bound_addr = endpoint
             .local_addr()
             .context("read WebTransport router listener address")?;
-        let config = Arc::new(WebTransportRouterRuntimeConfig {
+        let (trust_generation, _) = watch::channel(0);
+        let runtime_config = Arc::new(WebTransportRouterRuntimeConfig {
             connect_timeout: config.connect_timeout,
             hostname_matcher: HostnameMatcher::new(
                 &config.advertised_hostname_template,
                 &config.target_namespace,
             ),
-            upstream_client_config,
+            upstream_client_config: RwLock::new(upstream_client_config),
+            trust_generation,
         });
 
         Ok(Self {
             endpoint,
             bound_addr,
-            config,
+            config: runtime_config,
+            relay_config,
+            server_identity_reloader: config.server_identity_reloader,
+            client_trust_reloader: config.client_trust_reloader,
+            tls_reload_interval: config.tls_reload_interval,
         })
     }
 
@@ -117,11 +132,82 @@ impl WebTransportRouterRuntime {
         connection_tasks: TaskTracker,
     ) -> Result<()> {
         info!(addr = %self.bound_addr, "WebTransport router listening");
+        let mut server_identity_reloader = self.server_identity_reloader;
+        let mut client_trust_reloader = self.client_trust_reloader;
+        if let Some(reloader) = &server_identity_reloader
+            && let Some(validity) =
+                stargate_tls::server_identity_effective_validity(reloader.current_identity())?
+        {
+            metrics.set_tls_certificate_expiry(validity.not_after_unix_seconds);
+        }
+        let mut reload_interval = tokio::time::interval(self.tls_reload_interval);
+        reload_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     self.endpoint.close(0u32.into(), b"shutdown");
                     return Ok(());
+                }
+                _ = reload_interval.tick(), if server_identity_reloader.is_some() || client_trust_reloader.is_some() => {
+                    if let Some(reloader) = server_identity_reloader.as_mut() {
+                        match reloader.load_candidate() {
+                            Ok(Some(identity)) => {
+                                let activation = (|| -> Result<_> {
+                                    let server_config = build_webtransport_server_config(&identity, self.relay_config)?;
+                                    let validity = stargate_tls::server_identity_effective_validity(&identity)?
+                                        .context("reloaded server identity has no leaf certificate")?;
+                                    Ok((server_config, validity))
+                                })();
+                                match activation {
+                                    Ok((server_config, validity)) => {
+                                        self.endpoint.set_server_config(Some(server_config));
+                                        reloader.commit(identity);
+                                        metrics.set_tls_certificate_expiry(validity.not_after_unix_seconds);
+                                        metrics.observe_tls_reload("server_identity", "success");
+                                        info!(component = "stargate-k8s-router", material_type = "server_identity", result = "success", not_before_unix_seconds = validity.not_before_unix_seconds, not_after_unix_seconds = validity.not_after_unix_seconds, "TLS material reloaded");
+                                    }
+                                    Err(error) => {
+                                        metrics.observe_tls_reload("server_identity", "rejected");
+                                        warn!(component = "stargate-k8s-router", material_type = "server_identity", result = "rejected", %error, "TLS material activation rejected; retaining last-known-good configuration");
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                metrics.observe_tls_reload("server_identity", "rejected");
+                                warn!(component = "stargate-k8s-router", material_type = "server_identity", result = "rejected", %error, "TLS material reload rejected; retaining last-known-good configuration");
+                            }
+                        }
+                    }
+                    if let Some(reloader) = client_trust_reloader.as_mut() {
+                        match reloader.load_candidate() {
+                            Ok(Some(candidate)) => {
+                                let activation = (|| -> Result<()> {
+                                    let mut replacement = client_config(Some(&candidate), false)?;
+                                    replacement.transport_config(build_relay_transport_config(self.relay_config)?);
+                                    *self.config.upstream_client_config.write().map_err(|_| anyhow!("upstream TLS config lock poisoned"))? = replacement;
+                                    Ok(())
+                                })();
+                                match activation {
+                                    Ok(()) => {
+                                        reloader.commit(candidate);
+                                        self.config.trust_generation.send_modify(|generation| *generation += 1);
+                                        metrics.observe_tls_reload("client_trust", "success");
+                                        info!(component = "stargate-k8s-router", material_type = "client_trust", result = "success", "TLS material reloaded; existing upstream connections closing");
+                                    }
+                                    Err(error) => {
+                                        metrics.observe_tls_reload("client_trust", "rejected");
+                                        warn!(component = "stargate-k8s-router", material_type = "client_trust", result = "rejected", %error, "TLS material activation rejected; retaining last-known-good configuration");
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                metrics.observe_tls_reload("client_trust", "rejected");
+                                warn!(component = "stargate-k8s-router", material_type = "client_trust", result = "rejected", %error, "TLS material reload rejected; retaining last-known-good configuration");
+                            }
+                        }
+                    }
                 }
                 incoming = self.endpoint.accept() => {
                     let Some(incoming) = incoming else {
@@ -171,8 +257,13 @@ async fn dispatch_incoming(
     shutdown: CancellationToken,
     connection_tasks: TaskTracker,
 ) -> Result<()> {
+    let mut trust_updates = config.trust_generation.subscribe();
     let connection = tokio::select! {
         _ = shutdown.cancelled() => return Ok(()),
+        changed = trust_updates.changed() => {
+            changed.context("TLS trust generation channel closed")?;
+            return Ok(());
+        }
         connection = incoming => connection.context("accept downstream QUIC connection")?,
     };
     let route = {
@@ -207,6 +298,11 @@ async fn dispatch_incoming(
             downstream_connection.close(0u32.into(), b"router shutdown");
             return Ok(());
         }
+        changed = trust_updates.changed() => {
+            changed.context("TLS trust generation channel closed")?;
+            downstream_connection.close(0u32.into(), b"TLS trust configuration replaced");
+            return Ok(());
+        }
         downstream = DownstreamSession::from_connection(
             connection,
             config.connect_timeout,
@@ -224,16 +320,26 @@ async fn dispatch_incoming(
             return Err(error);
         }
     };
+    let upstream_client_config = config
+        .upstream_client_config
+        .read()
+        .map_err(|_| anyhow!("upstream TLS config lock poisoned"))?
+        .clone();
     let upstream = match tokio::select! {
         _ = shutdown.cancelled() => {
             downstream_connection.close(0u32.into(), b"router shutdown");
+            return Ok(());
+        }
+        changed = trust_updates.changed() => {
+            changed.context("TLS trust generation channel closed")?;
+            downstream_connection.close(0u32.into(), b"TLS trust configuration replaced");
             return Ok(());
         }
         upstream = async {
             let upstream = prepare_upstream_quic(
                 &target.quic_addr,
                 &server_name,
-                &config.upstream_client_config,
+                &upstream_client_config,
                 config.connect_timeout,
                 shutdown.child_token(),
             ).await?;
@@ -259,6 +365,11 @@ async fn dispatch_incoming(
     match tokio::select! {
         _ = shutdown.cancelled() => {
             downstream_connection.close(0u32.into(), b"router shutdown");
+            return Ok(());
+        }
+        changed = trust_updates.changed() => {
+            changed.context("TLS trust generation channel closed")?;
+            downstream_connection.close(0u32.into(), b"TLS trust configuration replaced");
             return Ok(());
         }
         result = downstream.forward(upstream, shutdown.clone(), connection_tasks) => result,
@@ -755,7 +866,10 @@ mod tests {
             relay_keep_alive_interval: Some(Duration::from_secs(5)),
             tls_cert_pem: None,
             tls_key_pem: None,
+            server_identity_reloader: None,
             upstream_tls_cert_pem: None,
+            client_trust_reloader: None,
+            tls_reload_interval: stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL,
             quic_insecure: true,
         }
     }

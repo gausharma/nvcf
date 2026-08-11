@@ -15,6 +15,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -88,6 +89,8 @@ macro_rules! metrics {
         #[derive(Debug)]
         pub struct PylonMetrics {
             registry: Arc<Registry>,
+            tls_initial_validation_complete: AtomicBool,
+            tls_identity_not_after: AtomicI64,
             $($($field: metric_type!($kind),)*)*
         }
 
@@ -102,7 +105,23 @@ macro_rules! metrics {
                     $(, $buckets)?
                 )?;
                 registry.register(Box::new($field.clone()))?;)*)*
-                Ok(Arc::new(Self { registry, $($($field,)*)* }))
+                let metrics = Arc::new(Self {
+                    registry,
+                    tls_initial_validation_complete: AtomicBool::new(false),
+                    tls_identity_not_after: AtomicI64::new(i64::MAX),
+                    $($($field,)*)*
+                });
+                for material_type in ["server_identity", "client_trust"] {
+                    for result in ["success", "rejected"] {
+                        metrics.tls_reloads_total
+                            .with_label_values(&[material_type, result])
+                            .inc_by(0);
+                    }
+                }
+                metrics.tls_certificate_expiry_seconds
+                    .with_label_values(&["server_identity"])
+                    .set(0);
+                Ok(metrics)
             }
         }
     };
@@ -116,6 +135,8 @@ metrics! {
         plain_gauge target_info("target_info", "Target metadata", ["service_version", "service_name", "commit"]);
         gauge registration_stream_connected("registration_stream_connected", "Binary gauge: 1 when a stargate registration stream is connected", ["router"]);
         gauge reverse_tunnel_connected("reverse_tunnel_connected", "Binary gauge: 1 when a reverse QUIC tunnel is connected to a stargate router", ["router"]);
+        counter tls_reloads_total("tls_reloads_total", "TLS material reload attempts by material type and result", ["material_type", "result"]);
+        gauge tls_certificate_expiry_seconds("tls_certificate_expiry_seconds", "Unix timestamp when the active TLS certificate expires", ["material_type"]);
     }
     request {
         gauge inflight("requests_inflight", "Current number of observed requests in flight", ["model"]);
@@ -201,6 +222,37 @@ macro_rules! metric_observer {
 }
 
 impl PylonMetrics {
+    pub fn observe_tls_reload(&self, material_type: &str, result: &str) {
+        self.tls_reloads_total
+            .with_label_values(&[material_type, result])
+            .inc();
+    }
+
+    pub fn set_tls_certificate_expiry(&self, unix_seconds: i64) {
+        self.tls_identity_not_after
+            .store(unix_seconds, Ordering::Release);
+        self.tls_certificate_expiry_seconds
+            .with_label_values(&["server_identity"])
+            .set(unix_seconds);
+    }
+
+    pub fn mark_tls_initial_validation_complete(&self) {
+        self.tls_initial_validation_complete
+            .store(true, Ordering::Release);
+    }
+
+    pub fn tls_identity_is_ready(&self) -> bool {
+        if !self.tls_initial_validation_complete.load(Ordering::Acquire) {
+            return false;
+        }
+        let expiry = self.tls_identity_not_after.load(Ordering::Acquire);
+        expiry == i64::MAX
+            || (expiry >= 0
+                && std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .is_ok_and(|now| now.as_secs() <= expiry as u64))
+    }
+
     pub fn registry(&self) -> Arc<Registry> {
         self.registry.clone()
     }
@@ -590,6 +642,14 @@ async fn get_metrics(
     ))
 }
 
+async fn get_readyz(State(metrics): State<Arc<PylonMetrics>>) -> StatusCode {
+    if metrics.tls_identity_is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 owned_task_handle!(MetricsServerHandle);
 
 pub async fn start_metrics_server(
@@ -602,6 +662,35 @@ pub async fn start_metrics_server(
 
     let listener = TcpListener::bind(addr).await?;
     info!(addr = %addr, "pylon metrics server listening");
+
+    let task = OwnedTask::spawn("metrics server", move |stop| async move {
+        if let Err(error) = axum::serve(listener, router)
+            .with_graceful_shutdown(stop.cancelled_owned())
+            .await
+        {
+            error!(error = %error, "pylon metrics server failed");
+        }
+    });
+    Ok(MetricsServerHandle { task })
+}
+
+pub async fn start_metrics_server_with_readiness(
+    addr: SocketAddr,
+    metrics: Arc<PylonMetrics>,
+) -> anyhow::Result<MetricsServerHandle> {
+    let router = Router::new()
+        .route(
+            "/metrics",
+            get({
+                let registry = metrics.registry();
+                move || get_metrics(State(registry.clone()))
+            }),
+        )
+        .route("/readyz", get(get_readyz))
+        .with_state(metrics);
+
+    let listener = TcpListener::bind(addr).await?;
+    info!(addr = %addr, "pylon metrics and readiness server listening");
 
     let task = OwnedTask::spawn("metrics server", move |stop| async move {
         if let Err(error) = axum::serve(listener, router)
@@ -627,6 +716,30 @@ mod tests {
         CurrentModelStats, PylonMetrics, PylonRuntimeState, RequestObservation,
         RequestObservationEndpoint, RequestObservationState,
     };
+
+    #[test]
+    fn tls_reload_metrics_are_preinitialized() {
+        let metrics = PylonMetrics::new().expect("metrics should initialize");
+        assert!(!metrics.tls_identity_is_ready());
+        metrics.observe_tls_reload("client_trust", "success");
+        metrics.set_tls_certificate_expiry(1_800_000_000);
+        assert!(!metrics.tls_identity_is_ready());
+        metrics.mark_tls_initial_validation_complete();
+        let body = metrics.gather_text().expect("metrics should encode");
+
+        assert!(body.contains(
+            r#"pylon_tls_reloads_total{material_type="client_trust",result="success"} 1"#
+        ));
+        assert!(body.contains(
+            r#"pylon_tls_reloads_total{material_type="server_identity",result="rejected"} 0"#
+        ));
+        assert!(body.contains(
+            r#"pylon_tls_certificate_expiry_seconds{material_type="server_identity"} 1800000000"#
+        ));
+        assert!(metrics.tls_identity_is_ready());
+        metrics.set_tls_certificate_expiry(0);
+        assert!(!metrics.tls_identity_is_ready());
+    }
 
     fn observation(
         request_id: &str,

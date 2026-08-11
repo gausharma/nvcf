@@ -15,6 +15,9 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -41,9 +44,35 @@ use super::{QuicTunnelConfig, StreamingResponse};
 
 pub struct QuicHttpProxy {
     pub(super) config: QuicTunnelConfig,
-    pub(super) endpoint_v4: Arc<Endpoint>,
-    pub(super) endpoint_v6: Arc<Endpoint>,
+    client_endpoints: RwLock<ClientEndpoints>,
+    pub(super) metrics: OnceLock<Arc<crate::metrics::StargateMetrics>>,
+    server_identity_not_after: AtomicI64,
     pub(super) authenticator: Arc<dyn WorkerAuthenticator>,
+}
+
+struct ClientEndpoints {
+    endpoint_v4: Arc<Endpoint>,
+    endpoint_v6: Arc<Endpoint>,
+}
+
+impl ClientEndpoints {
+    fn build(client_config: quinn::ClientConfig) -> Result<Self> {
+        let mut endpoint_v4 = Endpoint::client("0.0.0.0:0".parse()?)?;
+        let mut endpoint_v6 = Endpoint::client("[::]:0".parse()?)?;
+        endpoint_v4.set_default_client_config(client_config.clone());
+        endpoint_v6.set_default_client_config(client_config);
+        Ok(Self {
+            endpoint_v4: Arc::new(endpoint_v4),
+            endpoint_v6: Arc::new(endpoint_v6),
+        })
+    }
+
+    fn close(&self) {
+        self.endpoint_v4
+            .close(0u32.into(), b"TLS trust configuration replaced");
+        self.endpoint_v6
+            .close(0u32.into(), b"TLS trust configuration replaced");
+    }
 }
 
 impl QuicHttpProxy {
@@ -60,17 +89,116 @@ impl QuicHttpProxy {
             config.quic_insecure,
             config.tunnel_protocol,
         )?;
-        let mut endpoint_v4 = Endpoint::client("0.0.0.0:0".parse()?)?;
-        let mut endpoint_v6 = Endpoint::client("[::]:0".parse()?)?;
-        endpoint_v4.set_default_client_config(client_config.clone());
-        endpoint_v6.set_default_client_config(client_config);
+        let client_endpoints = ClientEndpoints::build(client_config)?;
+        let server_identity_not_after =
+            stargate_tls::server_identity_effective_validity(&config.server_tls_identity)?
+                .map_or(i64::MAX, |validity| validity.not_after_unix_seconds);
 
         Ok(Self {
             config,
-            endpoint_v4: Arc::new(endpoint_v4),
-            endpoint_v6: Arc::new(endpoint_v6),
+            client_endpoints: RwLock::new(client_endpoints),
+            metrics: OnceLock::new(),
+            server_identity_not_after: AtomicI64::new(server_identity_not_after),
             authenticator,
         })
+    }
+
+    pub(crate) fn set_metrics(&self, metrics: Arc<crate::metrics::StargateMetrics>) {
+        if self.metrics.set(metrics.clone()).is_ok() {
+            let expiry = self.server_identity_not_after.load(Ordering::Acquire);
+            if expiry != i64::MAX {
+                metrics.set_tls_certificate_expiry(expiry);
+            }
+        }
+    }
+
+    pub(crate) fn update_server_identity_expiry_from_validity(
+        &self,
+        validity: Option<&stargate_tls::CertificateValidity>,
+    ) {
+        let expiry = validity.map_or(i64::MAX, |validity| validity.not_after_unix_seconds);
+        self.server_identity_not_after
+            .store(expiry, Ordering::Release);
+        if expiry != i64::MAX
+            && let Some(metrics) = self.metrics.get()
+        {
+            metrics.set_tls_certificate_expiry(expiry);
+        }
+    }
+
+    pub(crate) fn tls_identity_is_ready(&self) -> bool {
+        let expiry = self.server_identity_not_after.load(Ordering::Acquire);
+        expiry == i64::MAX
+            || (expiry >= 0
+                && std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .is_ok_and(|now| now.as_secs() <= expiry as u64))
+    }
+
+    pub(crate) async fn run_client_trust_reloader(
+        self: Arc<Self>,
+        mut reloader: stargate_tls::ClientTrustReloader,
+        poll_interval: Duration,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        ensure!(
+            !poll_interval.is_zero(),
+            "TLS reload interval must be positive"
+        );
+        let mut interval = tokio::time::interval(poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                _ = interval.tick() => {
+                    match reloader.load_candidate() {
+                        Ok(None) => {}
+                        Ok(Some(candidate)) => {
+                            let activation = (|| -> Result<ClientEndpoints> {
+                                let client_config = build_client_config(
+                                    Some(&candidate),
+                                    false,
+                                    self.config.tunnel_protocol,
+                                )?;
+                                let replacement = ClientEndpoints::build(client_config)?;
+                                let mut active = self.client_endpoints.write().map_err(|_| {
+                                    anyhow!("TLS client endpoint lock poisoned")
+                                })?;
+                                Ok(std::mem::replace(&mut *active, replacement))
+                            })();
+                            match activation {
+                                Ok(previous) => {
+                                    reloader.commit(candidate);
+                                    previous.close();
+                                    if let Some(metrics) = self.metrics.get() {
+                                        metrics.tls_reloads_total("client_trust", "success").inc();
+                                    }
+                                    tracing::info!(component = "stargate", material_type = "client_trust", result = "success", "TLS material reloaded; existing client connections closed");
+                                }
+                                Err(error) => {
+                                    if let Some(metrics) = self.metrics.get() {
+                                        metrics.tls_reloads_total("client_trust", "rejected").inc();
+                                    }
+                                    tracing::warn!(component = "stargate", material_type = "client_trust", result = "rejected", error = %error, "TLS material activation rejected; retaining last-known-good configuration");
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(metrics) = self.metrics.get() {
+                                metrics.tls_reloads_total("client_trust", "rejected").inc();
+                            }
+                            tracing::warn!(
+                                component = "stargate",
+                                material_type = "client_trust",
+                                result = "rejected",
+                                error = %error,
+                                "TLS material reload rejected; retaining last-known-good configuration"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) async fn connect_direct_registration(
@@ -106,12 +234,21 @@ impl QuicHttpProxy {
         TunnelConnectionSet::new(connections)
     }
 
-    async fn connect_direct_connection(&self, target_url: &str) -> Result<TunnelConnection> {
+    pub(super) async fn connect_direct_connection(
+        &self,
+        target_url: &str,
+    ) -> Result<TunnelConnection> {
         let addr = parse_quic_addr(target_url)?;
-        let endpoint = if addr.is_ipv6() {
-            self.endpoint_v6.as_ref()
-        } else {
-            self.endpoint_v4.as_ref()
+        let endpoint = {
+            let endpoints = self
+                .client_endpoints
+                .read()
+                .map_err(|_| anyhow!("TLS client endpoint lock poisoned"))?;
+            if addr.is_ipv6() {
+                endpoints.endpoint_v6.clone()
+            } else {
+                endpoints.endpoint_v4.clone()
+            }
         };
         let connect = endpoint
             .connect(addr, "stargate")

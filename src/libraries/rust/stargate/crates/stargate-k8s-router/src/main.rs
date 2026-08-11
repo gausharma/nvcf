@@ -109,8 +109,40 @@ enum RouterTunnelConfig {
 impl RouterStartupConfig {
     fn from_args(args: Args) -> Result<Self> {
         let relay_endpoint_config = relay_endpoint_config_from_args(&args)?;
-        let tls_cert_pem = read_optional_file(args.tls_cert_path.as_deref())?;
-        let tls_key_pem = read_optional_file(args.tls_key_path.as_deref())?;
+        let server_identity_reloader = match (&args.tls_cert_path, &args.tls_key_path) {
+            (Some(cert_path), Some(key_path)) => Some(
+                stargate_tls::ServerIdentityReloader::load(cert_path.into(), key_path.into())
+                    .context("load initial router TLS server identity")?,
+            ),
+            (None, None) => None,
+            (Some(_), None) => bail!("--tls-key-path is required with --tls-cert-path"),
+            (None, Some(_)) => bail!("--tls-cert-path is required with --tls-key-path"),
+        };
+        let client_trust_reloader = if args.quic_insecure {
+            None
+        } else {
+            args.tls_cert_path
+                .as_ref()
+                .map(|path| {
+                    stargate_tls::ClientTrustReloader::load(path.into())
+                        .map(|(reloader, _)| reloader)
+                })
+                .transpose()?
+        };
+        let tls_cert_pem = server_identity_reloader.as_ref().and_then(|reloader| {
+            match reloader.current_identity() {
+                stargate_tls::ServerTlsIdentity::Provided { cert_pem, .. } => {
+                    Some(cert_pem.clone())
+                }
+                stargate_tls::ServerTlsIdentity::SelfSigned => None,
+            }
+        });
+        let tls_key_pem = server_identity_reloader.as_ref().and_then(|reloader| {
+            match reloader.current_identity() {
+                stargate_tls::ServerTlsIdentity::Provided { key_pem, .. } => Some(key_pem.clone()),
+                stargate_tls::ServerTlsIdentity::SelfSigned => None,
+            }
+        });
         let grpc = GrpcRouterConfig {
             advertised_hostname_template: args.advertised_hostname_template.clone(),
             target_namespace: args.target_namespace.clone(),
@@ -131,10 +163,30 @@ impl RouterStartupConfig {
                     relay_keep_alive_interval: relay_endpoint_config.keep_alive_interval,
                     tls_cert_pem,
                     tls_key_pem,
+                    client_trust_pem: client_trust_reloader
+                        .as_ref()
+                        .map(|reloader| reloader.current_pem().to_vec()),
+                    server_identity_reloader,
+                    client_trust_reloader,
+                    tls_reload_interval: stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL,
                     quic_insecure: args.quic_insecure,
                 })
             }
             RouterTunnelProtocol::WebTransport => {
+                let client_trust_reloader = if args.quic_insecure {
+                    None
+                } else {
+                    args.upstream_tls_cert_path
+                        .as_ref()
+                        .map(|path| {
+                            stargate_tls::ClientTrustReloader::load(path.into())
+                                .map(|(reloader, _)| reloader)
+                        })
+                        .transpose()?
+                };
+                let upstream_tls_cert_pem = client_trust_reloader
+                    .as_ref()
+                    .map(|reloader| reloader.current_pem().to_vec());
                 RouterTunnelConfig::WebTransport(WebTransportRouterConfig {
                     listen_addr: args.reverse_tunnel_listen_addr,
                     advertised_hostname_template: grpc.advertised_hostname_template.clone(),
@@ -144,9 +196,10 @@ impl RouterStartupConfig {
                     relay_keep_alive_interval: relay_endpoint_config.keep_alive_interval,
                     tls_cert_pem,
                     tls_key_pem,
-                    upstream_tls_cert_pem: read_optional_file(
-                        args.upstream_tls_cert_path.as_deref(),
-                    )?,
+                    server_identity_reloader,
+                    upstream_tls_cert_pem,
+                    client_trust_reloader,
+                    tls_reload_interval: stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL,
                     quic_insecure: args.quic_insecure,
                 })
             }
@@ -333,11 +386,6 @@ fn log_startup(config: &RouterStartupConfig) {
     );
 }
 
-fn read_optional_file(path: Option<&str>) -> Result<Option<Vec<u8>>> {
-    path.map(|path| std::fs::read(path).with_context(|| format!("failed to read {path}")))
-        .transpose()
-}
-
 fn relay_endpoint_config_from_args(args: &Args) -> Result<RelayEndpointConfig> {
     if args.relay_idle_timeout_ms == 0 {
         bail!("--relay-idle-timeout-ms must be greater than 0");
@@ -431,8 +479,10 @@ mod tests {
 
     #[test]
     fn startup_config_derives_runtime_configs_from_args() {
-        let cert = test_file(b"cert-bytes");
-        let key = test_file(b"key-bytes");
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (cert_pem, key_pem) = stargate_tls::generate_self_signed_cert().unwrap();
+        let cert = test_file(&cert_pem);
+        let key = test_file(&key_pem);
         let upstream_ca = test_file(b"upstream-ca-bytes");
         let config = startup_config(&[
             "--listen-addr",
@@ -500,11 +550,8 @@ mod tests {
             quic_config.relay_keep_alive_interval,
             Some(Duration::from_millis(5000))
         );
-        assert_eq!(
-            quic_config.tls_cert_pem.as_deref(),
-            Some(&b"cert-bytes"[..])
-        );
-        assert_eq!(quic_config.tls_key_pem.as_deref(), Some(&b"key-bytes"[..]));
+        assert_eq!(quic_config.tls_cert_pem.as_deref(), Some(&*cert_pem));
+        assert_eq!(quic_config.tls_key_pem.as_deref(), Some(&*key_pem));
         assert!(quic_config.quic_insecure);
 
         let webtransport_config = startup_config(&[
@@ -519,10 +566,7 @@ mod tests {
                 "WebTransport startup configuration must construct only the WebTransport runtime"
             );
         };
-        assert_eq!(
-            webtransport_tunnel.upstream_tls_cert_pem.as_deref(),
-            Some(&b"upstream-ca-bytes"[..])
-        );
+        assert_eq!(webtransport_tunnel.upstream_tls_cert_pem.as_deref(), None);
         assert_eq!(
             webtransport_tunnel.listen_addr,
             "0.0.0.0:50072".parse().unwrap()

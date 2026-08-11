@@ -42,6 +42,7 @@ pub struct ReverseQuicTunnelConfig {
     pub upstream_http_base_url: String,
     pub forwarding: TunnelForwardingConfig,
     pub tls_cert_pem: Option<Vec<u8>>,
+    pub client_trust_provider: Option<stargate_tls::ClientTrustProvider>,
     pub quic_insecure: bool,
     pub tunnel_protocol: TunnelTransportProtocol,
     pub sni_override: Option<String>,
@@ -60,6 +61,7 @@ impl ReverseQuicTunnelConfig {
             upstream_http_base_url,
             forwarding: TunnelForwardingConfig::default(),
             tls_cert_pem: None,
+            client_trust_provider: None,
             quic_insecure: false,
             tunnel_protocol: TunnelTransportProtocol::RawQuic,
             sni_override: None,
@@ -162,8 +164,14 @@ where
 pub(super) async fn connect_reverse_quic_endpoint(
     config: &ReverseQuicTunnelConfig,
 ) -> Result<ReverseQuicClientConnection, TunnelError> {
+    let current_trust_pem = config
+        .client_trust_provider
+        .as_ref()
+        .map(stargate_tls::ClientTrustProvider::current_pem);
     let client_config = build_trusted_client_config(
-        config.tls_cert_pem.as_deref(),
+        current_trust_pem
+            .as_deref()
+            .or(config.tls_cert_pem.as_deref()),
         config.quic_insecure,
         config.tunnel_protocol,
     )

@@ -28,7 +28,8 @@ use pylon_lib::{
     ModelInitialization, ModelLifecycleConfig, ModelLifecycleHandle, ModelSource, PylonMetrics,
     PylonQueueMismatchRetryConfig, PylonRetryConfig, PylonRuntimeState, QuicHttpTunnelConfig,
     QuicHttpTunnelHandle, RequestQualityMonitorConfig, StatsCollectorConfig, StatsCollectorHandle,
-    TunnelForwardingConfig, UpstreamBackend, start_engine_stats_stream, start_metrics_server,
+    TunnelForwardingConfig, UpstreamBackend, start_engine_stats_stream,
+    start_metrics_server_with_readiness,
     start_model_lifecycle, start_quic_http_tunnel, start_stats_collector_with_engine_stats,
     stats_aggregator_update_channel,
 };
@@ -218,6 +219,10 @@ fn model_source_from_args(args: &Args) -> Result<ModelSource> {
 
 struct RunningPylon {
     registration_client: InferenceServerRegistrationClient,
+    registration_config: Option<InferenceServerRegistrationConfig>,
+    tls_trust_reloader: Option<stargate_tls::ClientTrustReloader>,
+    tls_reload_interval: Option<tokio::time::Interval>,
+    metrics: Arc<PylonMetrics>,
     engine_stats_stream: Option<RunningEngineStatsStream>,
     stats_collector: StatsCollectorHandle,
     model_lifecycle: ModelLifecycleHandle,
@@ -249,6 +254,45 @@ impl RunningPylon {
                     return result.map(|_| ());
                 }
                 result = self.registration_client.wait_for_exit() => critical_task_exit_error("registration session", result),
+                _ = async {
+                    match self.tls_reload_interval.as_mut() {
+                        Some(interval) => interval.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let reloader = self
+                        .tls_trust_reloader
+                        .as_mut()
+                        .expect("TLS reload interval requires a trust reloader");
+                    match reloader.load_candidate() {
+                        Ok(Some(candidate)) => {
+                            let mut replacement = self
+                                .registration_config
+                                .as_ref()
+                                .expect("trust reload requires a registration configuration")
+                                .clone();
+                            replacement.tls_cert_pem = Some(candidate.clone());
+                            match self.registration_client.start(replacement.clone()) {
+                                Ok(()) => {
+                                    reloader.commit(candidate);
+                                    self.registration_config = Some(replacement);
+                                    self.metrics.observe_tls_reload("client_trust", "success");
+                                    info!(component = "pylon", material_type = "client_trust", result = "success", "TLS material reloaded; restarted registration session");
+                                }
+                                Err(error) => {
+                                    self.metrics.observe_tls_reload("client_trust", "rejected");
+                                    warn!(component = "pylon", material_type = "client_trust", result = "rejected", %error, "TLS material activation rejected; retaining last-known-good registration session");
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            self.metrics.observe_tls_reload("client_trust", "rejected");
+                            warn!(component = "pylon", material_type = "client_trust", result = "rejected", %error, "TLS material reload rejected; retaining last-known-good configuration");
+                        }
+                    }
+                    continue;
+                }
                 result = async {
                     match self.engine_stats_stream.as_mut() {
                         Some(stream) => stream.handle.wait_for_exit().await,
@@ -334,7 +378,8 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
             .or(option_env!("GIT_COMMIT_SHA"))
             .unwrap_or(""),
     );
-    let metrics_server = start_metrics_server(plan.metrics_addr, metrics.registry()).await?;
+    let metrics_server =
+        start_metrics_server_with_readiness(plan.metrics_addr, metrics.clone()).await?;
     let stats_config = stats_collector_config_from_args(args, &plan.upstream);
     let (runtime_state, request_observation_rx) = PylonRuntimeState::observed(
         InferenceServerStatus::Active,
@@ -356,8 +401,44 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
         stats_update_rx,
         runtime_state.clone(),
     );
-    let tls_cert_pem = args.tls_cert_path.as_ref().map(std::fs::read).transpose()?;
-    let tls_key_pem = args.tls_key_path.as_ref().map(std::fs::read).transpose()?;
+    let server_identity_reloader = if plan.direct_tunnel_listen_addr().is_some() {
+        match (&args.tls_cert_path, &args.tls_key_path) {
+            (Some(cert_path), Some(key_path)) => Some(
+                stargate_tls::ServerIdentityReloader::load(cert_path.into(), key_path.into())
+                    .context("load initial Pylon TLS server identity")?,
+            ),
+            (None, None) => None,
+            (Some(_), None) => anyhow::bail!("--tls-key-path is required with --tls-cert-path"),
+            (None, Some(_)) => anyhow::bail!("--tls-cert-path is required with --tls-key-path"),
+        }
+    } else {
+        None
+    };
+    let (tls_trust_reloader, tls_reload_interval, client_trust_pem) =
+        if plan.backend_tunnel.is_reverse() && !args.quic_insecure {
+            let trust_path = args
+                .tls_cert_path
+                .as_ref()
+                .context("--tls-cert-path is required for secure reverse tunnels")?;
+            let (reloader, _) = stargate_tls::ClientTrustReloader::load(trust_path.into())
+                .context("load initial Pylon TLS client trust")?;
+            let current_pem = reloader.current_pem().to_vec();
+            let mut interval = tokio::time::interval(stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            (Some(reloader), Some(interval), Some(current_pem))
+        } else {
+            (None, None, None)
+        };
+    let (tls_cert_pem, tls_key_pem) = if let Some(reloader) = &server_identity_reloader {
+        match reloader.current_identity() {
+            stargate_tls::ServerTlsIdentity::Provided { cert_pem, key_pem } => {
+                (Some(cert_pem.clone()), Some(key_pem.clone()))
+            }
+            stargate_tls::ServerTlsIdentity::SelfSigned => (None, None),
+        }
+    } else {
+        (client_trust_pem, None)
+    };
     let forwarding =
         tunnel_forwarding_config_from_plan(plan, runtime_state.clone(), metrics.clone());
     let tunnel = start_direct_tunnel_from_plan(
@@ -366,6 +447,7 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
         &forwarding,
         tls_cert_pem.as_deref(),
         tls_key_pem,
+        server_identity_reloader,
     )
     .await?;
     if matches!(
@@ -386,7 +468,7 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
         },
         runtime_state.clone(),
         &stats_collector,
-        Some(metrics),
+        Some(metrics.clone()),
     )
     .await
     .context("pylon initial model initialization failed")?;
@@ -400,10 +482,15 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
         tls_cert_pem,
     );
     let mut registration_client = InferenceServerRegistrationClient::default();
-    registration_client.start(registration_config)?;
+    registration_client.start(registration_config.clone())?;
+    metrics.mark_tls_initial_validation_complete();
 
     Ok(RunningPylon {
         registration_client,
+        registration_config: Some(registration_config),
+        tls_trust_reloader,
+        tls_reload_interval,
+        metrics,
         engine_stats_stream,
         stats_collector,
         model_lifecycle,
@@ -443,12 +530,15 @@ async fn start_direct_tunnel_from_plan(
     forwarding: &TunnelForwardingConfig,
     tls_cert_pem: Option<&[u8]>,
     tls_key_pem: Option<Vec<u8>>,
+    server_identity_reloader: Option<stargate_tls::ServerIdentityReloader>,
 ) -> Result<Option<QuicHttpTunnelHandle>> {
     let Some(tunnel_config) =
         direct_tunnel_config(args, plan, forwarding, tls_cert_pem, tls_key_pem)
     else {
         return Ok(None);
     };
+    let mut tunnel_config = tunnel_config;
+    tunnel_config.server_identity_reloader = server_identity_reloader;
     let tunnel = start_quic_http_tunnel(tunnel_config).await?;
     info!(addr = %tunnel.listen_addr(), url = %format!("quic://{}", tunnel.listen_addr()), "QUIC tunnel listening");
     Ok(Some(tunnel))
@@ -475,6 +565,8 @@ fn direct_tunnel_config(
         forwarding: forwarding.clone(),
         tls_cert_pem: tls_cert_pem.map(Vec::from),
         tls_key_pem,
+        server_identity_reloader: None,
+        tls_reload_interval: stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL,
         tunnel_protocol: args.tunnel_protocol,
     })
 }
@@ -1024,10 +1116,14 @@ mod tests {
         .expect("test model lifecycle should start");
         RunningPylon {
             registration_client: InferenceServerRegistrationClient::default(),
+            registration_config: None,
+            tls_trust_reloader: None,
+            tls_reload_interval: None,
+            metrics: metrics.clone(),
             engine_stats_stream: None,
             stats_collector,
             model_lifecycle,
-            metrics_server: start_metrics_server(
+            metrics_server: pylon_lib::start_metrics_server(
                 "127.0.0.1:0".parse().expect("metrics address should parse"),
                 metrics.registry(),
             )
@@ -1102,7 +1198,7 @@ mod tests {
     async fn reverse_mode_direct_tunnel_startup_returns_no_tunnel_without_binding() {
         let (args, plan) = startup(&["--backend-connectivity", "reverse"]);
         let forwarding = test_forwarding(&plan);
-        let tunnel = start_direct_tunnel_from_plan(&args, &plan, &forwarding, None, None)
+        let tunnel = start_direct_tunnel_from_plan(&args, &plan, &forwarding, None, None, None)
             .await
             .expect("reverse mode should not start a direct tunnel");
 
@@ -1114,7 +1210,7 @@ mod tests {
     async fn direct_mode_direct_tunnel_startup_binds_and_reports_quic_url() {
         let (args, plan) = startup(&["--quic-listen-addr", "127.0.0.1:0"]);
         let forwarding = test_forwarding(&plan);
-        let tunnel = start_direct_tunnel_from_plan(&args, &plan, &forwarding, None, None)
+        let tunnel = start_direct_tunnel_from_plan(&args, &plan, &forwarding, None, None, None)
             .await
             .expect("direct mode should bind a direct tunnel")
             .expect("direct mode should return the tunnel handle");

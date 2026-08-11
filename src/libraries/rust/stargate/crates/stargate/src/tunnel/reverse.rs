@@ -15,6 +15,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -154,7 +155,62 @@ impl QuicHttpProxy {
             .local_addr()
             .context("reverse listener local addr")?;
 
-        let relay_endpoints = Arc::new(
+        if let Some(mut reloader) = self.config.server_identity_reloader.clone() {
+            let reload_endpoint = endpoint.clone();
+            let alpn_protocols = self.config.tunnel_protocol.alpn_protocols();
+            let reload_interval = self.config.tls_reload_interval;
+            let proxy = self.clone();
+            tasks.spawn_critical("TLS server identity reloader", move |stop| async move {
+                let mut interval = tokio::time::interval(reload_interval);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => return Ok(()),
+                        _ = interval.tick() => {
+                            match reloader.load_candidate() {
+                                Ok(Some(identity)) => {
+                                    let activation = (|| -> Result<_> {
+                                        let server_config = stargate_tls::build_quic_server_config(
+                                            &identity,
+                                            alpn_protocols.clone(),
+                                        )?;
+                                        let validity = stargate_tls::server_identity_effective_validity(&identity)?
+                                            .context("reloaded server identity has no leaf certificate")?;
+                                        Ok((server_config, validity))
+                                    })();
+                                    match activation {
+                                        Ok((server_config, validity)) => {
+                                            reload_endpoint.set_server_config(Some(server_config));
+                                            reloader.commit(identity);
+                                            proxy.update_server_identity_expiry_from_validity(Some(&validity));
+                                            if let Some(metrics) = proxy.metrics.get() {
+                                                metrics.tls_reloads_total("server_identity", "success").inc();
+                                            }
+                                            info!(component = "stargate", material_type = "server_identity", result = "success", not_before_unix_seconds = validity.not_before_unix_seconds, not_after_unix_seconds = validity.not_after_unix_seconds, "TLS material reloaded");
+                                        }
+                                        Err(error) => {
+                                            if let Some(metrics) = proxy.metrics.get() {
+                                                metrics.tls_reloads_total("server_identity", "rejected").inc();
+                                            }
+                                            warn!(component = "stargate", material_type = "server_identity", result = "rejected", %error, "TLS material activation rejected; retaining last-known-good configuration");
+                                        }
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    if let Some(metrics) = proxy.metrics.get() {
+                                        metrics.tls_reloads_total("server_identity", "rejected").inc();
+                                    }
+                                    warn!(component = "stargate", material_type = "server_identity", result = "rejected", %error, "TLS material reload rejected; retaining last-known-good configuration");
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        let relay_endpoints = Arc::new(RwLock::new(Arc::new(
             forwarding::build_relay_endpoints(
                 forwarding::RelayEndpointConfig::default(),
                 build_client_config(
@@ -164,7 +220,57 @@ impl QuicHttpProxy {
                 )?,
             )
             .context("build relay endpoints")?,
-        );
+        )));
+        if let Some(mut reloader) = self.config.client_trust_reloader.clone() {
+            let reload_endpoints = relay_endpoints.clone();
+            let tunnel_protocol = self.config.tunnel_protocol;
+            let poll_interval = self.config.tls_reload_interval;
+            let proxy = self.clone();
+            tasks.spawn_critical("TLS relay trust reloader", move |shutdown| async move {
+                let mut interval = tokio::time::interval(poll_interval);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return Ok(()),
+                        _ = interval.tick() => {
+                            match reloader.load_candidate() {
+                                Ok(Some(candidate)) => {
+                                    let activation = (|| -> Result<_> {
+                                        let client_config = build_client_config(Some(&candidate), false, tunnel_protocol)?;
+                                        let replacement = Arc::new(forwarding::build_relay_endpoints(forwarding::RelayEndpointConfig::default(), client_config)?);
+                                        let mut active = reload_endpoints.write().map_err(|_| anyhow!("relay endpoint lock poisoned"))?;
+                                        Ok(std::mem::replace(&mut *active, replacement))
+                                    })();
+                                    match activation {
+                                        Ok(previous) => {
+                                            reloader.commit(candidate);
+                                            previous.close(b"TLS trust configuration replaced");
+                                            if let Some(metrics) = proxy.metrics.get() {
+                                                metrics.tls_reloads_total("client_trust", "success").inc();
+                                            }
+                                            info!(component = "stargate", material_type = "client_trust", result = "success", "relay TLS trust reloaded; existing relay connections closed");
+                                        }
+                                        Err(error) => {
+                                            if let Some(metrics) = proxy.metrics.get() {
+                                                metrics.tls_reloads_total("client_trust", "rejected").inc();
+                                            }
+                                            warn!(component = "stargate", material_type = "client_trust", result = "rejected", %error, "TLS material activation rejected; retaining last-known-good configuration");
+                                        }
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    if let Some(metrics) = proxy.metrics.get() {
+                                        metrics.tls_reloads_total("client_trust", "rejected").inc();
+                                    }
+                                    warn!(component = "stargate", material_type = "client_trust", result = "rejected", %error, "relay TLS trust reload rejected; retaining last-known-good configuration");
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         let dispatch = ReverseDispatchContext {
             proxy: self.clone(),
@@ -209,7 +315,7 @@ struct ReverseDispatchContext {
     proxy: Arc<QuicHttpProxy>,
     state: Arc<StargateState>,
     forwarding: Option<Arc<dyn ForwardingResolver>>,
-    relay_endpoints: Arc<forwarding::RelayEndpoints>,
+    relay_endpoints: Arc<RwLock<Arc<forwarding::RelayEndpoints>>>,
     listen_port: u16,
     task_tracker: TaskTracker,
 }
@@ -234,10 +340,15 @@ async fn dispatch_incoming(
                     sni = %sni,
                     "relaying QUIC connection to peer"
                 );
+                let relay_endpoints = dispatch
+                    .relay_endpoints
+                    .read()
+                    .map_err(|_| anyhow!("relay endpoint lock poisoned"))?
+                    .clone();
                 return forwarding::forward_quic_connection(
                     connection,
                     &peer,
-                    &dispatch.relay_endpoints,
+                    &relay_endpoints,
                     dispatch.proxy.config.connect_timeout,
                 )
                 .await;
