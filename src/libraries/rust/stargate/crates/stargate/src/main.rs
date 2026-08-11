@@ -383,7 +383,7 @@ mod tests {
 
     use parking_lot::Mutex;
     use stargate::proxy::{ProxyRetryConfig, ProxyTransportConfig};
-    use stargate_tls::ServerTlsIdentity;
+    use stargate_tls::{ServerTlsIdentity, generate_self_signed_cert};
 
     use super::startup::{
         DiscoveryAndForwarding, WorkerAuthStartup, bind_reverse_tunnel_from_args,
@@ -772,7 +772,11 @@ mod tests {
 
     #[test]
     fn direct_quic_tls_trust_cert_does_not_require_server_key() {
-        let cert = tempfile::NamedTempFile::new().expect("cert file should be creatable");
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (cert_pem, _) = generate_self_signed_cert().expect("test certificate should generate");
+        let mut cert = tempfile::NamedTempFile::new().expect("cert file should be creatable");
+        cert.write_all(&cert_pem)
+            .expect("test certificate should be writable");
         let path = cert.path().to_str().expect("cert path should be UTF-8");
         let args = try_parse_argv(["--tls-cert-path", path]).expect("cert path should parse");
         assert_eq!(
@@ -794,7 +798,10 @@ mod tests {
         .expect("reverse listener arguments should parse");
         let err = proxy_transport_config_from_args(&args)
             .expect_err("reverse listener server TLS still needs a complete PEM pair");
-        assert_error_contains(&err, "TLS key PEM is required");
+        assert_error_contains(
+            &err,
+            "TLS key path is required when TLS cert path is provided",
+        );
     }
 
     #[test]
