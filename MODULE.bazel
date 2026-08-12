@@ -326,6 +326,20 @@ crate.from_cargo(
     ],
     supported_platform_triples = SUPPORTED_TRIPLES,
 )
+
+# notify's Linux backend enables mio's default `log` feature. crate_universe
+# unifies that feature across supported triples while retaining the dependency's
+# Linux-only cfg, so add the matching dependency for native macOS builds.
+crate.annotation_select(
+    crate = "mio",
+    deps = ["@stargate_crates__log-0.4.29//:log"],
+    repositories = ["stargate_crates"],
+    triples = [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+    ],
+    version = "1.2.1",
+)
 use_repo(crate, "nvcf_invocation_crates", "rs_autoscaler_crates", "stargate_crates")
 
 # ============================================================================
