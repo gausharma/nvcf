@@ -98,7 +98,6 @@ fn crate_root_exports_tunnel_config_public_api() {
             ..Default::default()
         },
         tls_cert_pem: None,
-        client_trust_provider: None,
         quic_insecure: true,
         tunnel_protocol: TunnelTransportProtocol::Http3,
         sni_override: None,

@@ -121,7 +121,7 @@ pub(super) fn proxy_transport_config_from_args(args: &Args) -> Result<ProxyTrans
     } else {
         args.tls_cert_path
             .as_ref()
-            .map(|path| ClientTrustReloader::load(path.into()).map(|(reloader, _)| reloader))
+            .map(|path| ClientTrustReloader::load(path.into()))
             .transpose()?
     };
     let tls_cert_pem = client_trust_reloader

@@ -15,6 +15,7 @@
 
 use anyhow::Result;
 use prometheus::{Encoder, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
+use stargate_tls::{TlsMaterial, TlsReloadOutcome};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -55,10 +56,10 @@ impl RouterMetrics {
             &["material_type", "result"],
         )?;
         registry.register(Box::new(tls_reloads_total.clone()))?;
-        for material_type in ["server_identity", "client_trust"] {
-            for result in ["success", "rejected"] {
+        for material in TlsMaterial::ALL {
+            for outcome in TlsReloadOutcome::ALL {
                 tls_reloads_total
-                    .with_label_values(&[material_type, result])
+                    .with_label_values(&[material.as_str(), outcome.as_str()])
                     .inc_by(0);
             }
         }
@@ -96,9 +97,9 @@ impl RouterMetrics {
             .inc();
     }
 
-    pub fn observe_tls_reload(&self, material_type: &str, result: &str) {
+    pub fn observe_tls_reload(&self, material: TlsMaterial, outcome: TlsReloadOutcome) {
         self.tls_reloads_total
-            .with_label_values(&[material_type, result])
+            .with_label_values(&[material.as_str(), outcome.as_str()])
             .inc();
     }
 
@@ -171,7 +172,10 @@ mod tests {
     #[test]
     fn tls_reload_metrics_are_preinitialized_and_bounded() {
         let metrics = RouterMetrics::new().expect("metrics should initialize");
-        metrics.observe_tls_reload("server_identity", "success");
+        metrics.observe_tls_reload(
+            stargate_tls::TlsMaterial::ServerIdentity,
+            stargate_tls::TlsReloadOutcome::Success,
+        );
         metrics.set_tls_certificate_expiry(1_800_000_000);
         let body = metrics.gather().expect("metrics should encode");
 

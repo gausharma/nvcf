@@ -183,13 +183,23 @@ impl QuicHttpProxy {
                                             reloader.commit(identity);
                                             proxy.update_server_identity_expiry_from_validity(Some(&validity));
                                             if let Some(metrics) = proxy.metrics.get() {
-                                                metrics.tls_reloads_total("server_identity", "success").inc();
+                                                metrics
+                                                    .tls_reloads_total(
+                                                        stargate_tls::TlsMaterial::ServerIdentity,
+                                                        stargate_tls::TlsReloadOutcome::Success,
+                                                    )
+                                                    .inc();
                                             }
                                             info!(component = "stargate", material_type = "server_identity", result = "success", not_before_unix_seconds = validity.not_before_unix_seconds, not_after_unix_seconds = validity.not_after_unix_seconds, "TLS material reloaded");
                                         }
                                         Err(error) => {
                                             if let Some(metrics) = proxy.metrics.get() {
-                                                metrics.tls_reloads_total("server_identity", "rejected").inc();
+                                                metrics
+                                                    .tls_reloads_total(
+                                                        stargate_tls::TlsMaterial::ServerIdentity,
+                                                        stargate_tls::TlsReloadOutcome::Rejected,
+                                                    )
+                                                    .inc();
                                             }
                                             warn!(component = "stargate", material_type = "server_identity", result = "rejected", %error, "TLS material activation rejected; retaining last-known-good configuration");
                                         }
@@ -198,7 +208,12 @@ impl QuicHttpProxy {
                                 Ok(None) => {}
                                 Err(error) => {
                                     if let Some(metrics) = proxy.metrics.get() {
-                                        metrics.tls_reloads_total("server_identity", "rejected").inc();
+                                        metrics
+                                            .tls_reloads_total(
+                                                stargate_tls::TlsMaterial::ServerIdentity,
+                                                stargate_tls::TlsReloadOutcome::Rejected,
+                                            )
+                                            .inc();
                                     }
                                     warn!(component = "stargate", material_type = "server_identity", result = "rejected", %error, "TLS material reload rejected; retaining last-known-good configuration");
                                 }
@@ -244,13 +259,23 @@ impl QuicHttpProxy {
                                             reloader.commit(candidate);
                                             previous.close(b"TLS trust configuration replaced");
                                             if let Some(metrics) = proxy.metrics.get() {
-                                                metrics.tls_reloads_total("client_trust", "success").inc();
+                                                metrics
+                                                    .tls_reloads_total(
+                                                        stargate_tls::TlsMaterial::ClientTrust,
+                                                        stargate_tls::TlsReloadOutcome::Success,
+                                                    )
+                                                    .inc();
                                             }
                                             info!(component = "stargate", material_type = "client_trust", result = "success", "relay TLS trust reloaded; existing relay connections closed");
                                         }
                                         Err(error) => {
                                             if let Some(metrics) = proxy.metrics.get() {
-                                                metrics.tls_reloads_total("client_trust", "rejected").inc();
+                                                metrics
+                                                    .tls_reloads_total(
+                                                        stargate_tls::TlsMaterial::ClientTrust,
+                                                        stargate_tls::TlsReloadOutcome::Rejected,
+                                                    )
+                                                    .inc();
                                             }
                                             warn!(component = "stargate", material_type = "client_trust", result = "rejected", %error, "TLS material activation rejected; retaining last-known-good configuration");
                                         }
@@ -259,7 +284,12 @@ impl QuicHttpProxy {
                                 Ok(None) => {}
                                 Err(error) => {
                                     if let Some(metrics) = proxy.metrics.get() {
-                                        metrics.tls_reloads_total("client_trust", "rejected").inc();
+                                        metrics
+                                            .tls_reloads_total(
+                                                stargate_tls::TlsMaterial::ClientTrust,
+                                                stargate_tls::TlsReloadOutcome::Rejected,
+                                            )
+                                            .inc();
                                     }
                                     warn!(component = "stargate", material_type = "client_trust", result = "rejected", %error, "relay TLS trust reload rejected; retaining last-known-good configuration");
                                 }

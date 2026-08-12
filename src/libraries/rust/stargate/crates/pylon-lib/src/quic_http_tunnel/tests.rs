@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::extract::Request;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::Event;
@@ -3372,91 +3372,6 @@ async fn direct_tunnel_reloads_server_identity_for_new_connections() -> Result<(
     assert!(connect(tunnel.listen_addr(), &first_cert).await.is_err());
 
     tunnel.shutdown().await;
-    fs::remove_dir_all(root)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn reverse_tunnel_uses_reloaded_client_trust_for_new_connections() -> Result<()> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let root = std::env::temp_dir().join(format!(
-        "pylon-trust-reload-{}-{}",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("test")
-    ));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir(&root)?;
-    let trust_path = root.join("ca.crt");
-    let (first_cert, first_key) = stargate_tls::generate_self_signed_cert()?;
-    let (second_cert, second_key) = stargate_tls::generate_self_signed_cert()?;
-    fs::write(&trust_path, &first_cert)?;
-    let (mut reloader, provider) = stargate_tls::ClientTrustReloader::load(trust_path.clone())?;
-
-    let first_server = Endpoint::server(
-        stargate_tls::build_quic_server_config(
-            &ServerTlsIdentity::Provided {
-                cert_pem: first_cert.clone(),
-                key_pem: first_key,
-            },
-            Vec::new(),
-        )?,
-        "127.0.0.1:0".parse()?,
-    )?;
-    let mut config = ReverseQuicTunnelConfig::new(
-        first_server.local_addr()?.to_string(),
-        "pylon-a".to_string(),
-        "http://127.0.0.1:1".to_string(),
-    );
-    config.sni_override = Some("localhost".to_string());
-    config.client_trust_provider = Some(provider.clone());
-    let first_accept = async {
-        Ok::<_, anyhow::Error>(
-            first_server
-                .accept()
-                .await
-                .context("accept first connection")?
-                .await?,
-        )
-    };
-    let first_client = connect_reverse_quic_endpoint(&config);
-    let (first_client, first_server_connection) = tokio::join!(first_client, first_accept);
-    let first_client = first_client?;
-    let first_server_connection = first_server_connection?;
-    first_client.connection.close(0u32.into(), b"rotate trust");
-    first_server_connection.close(0u32.into(), b"rotate trust");
-
-    fs::write(&trust_path, &second_cert)?;
-    assert!(reloader.reload_if_changed()?);
-    let second_server = Endpoint::server(
-        stargate_tls::build_quic_server_config(
-            &ServerTlsIdentity::Provided {
-                cert_pem: second_cert,
-                key_pem: second_key,
-            },
-            Vec::new(),
-        )?,
-        "127.0.0.1:0".parse()?,
-    )?;
-    config.target_addr = second_server.local_addr()?.to_string();
-    let second_accept = async {
-        Ok::<_, anyhow::Error>(
-            second_server
-                .accept()
-                .await
-                .context("accept second connection")?
-                .await?,
-        )
-    };
-    let second_client = connect_reverse_quic_endpoint(&config);
-    let (second_client, second_server_connection) = tokio::join!(second_client, second_accept);
-    let second_client = second_client?;
-    let second_server_connection = second_server_connection?;
-    second_client
-        .connection
-        .close(0u32.into(), b"test complete");
-    second_server_connection.close(0u32.into(), b"test complete");
-
     fs::remove_dir_all(root)?;
     Ok(())
 }

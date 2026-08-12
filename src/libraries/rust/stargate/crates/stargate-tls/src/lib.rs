@@ -37,6 +37,42 @@ pub const DEFAULT_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(300);
 
 const TLS_WATCH_DEBOUNCE: Duration = Duration::from_millis(100);
 
+/// TLS material that can be reloaded at runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlsMaterial {
+    ServerIdentity,
+    ClientTrust,
+}
+
+impl TlsMaterial {
+    pub const ALL: [Self; 2] = [Self::ServerIdentity, Self::ClientTrust];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ServerIdentity => "server_identity",
+            Self::ClientTrust => "client_trust",
+        }
+    }
+}
+
+/// Result of attempting to activate changed TLS material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlsReloadOutcome {
+    Success,
+    Rejected,
+}
+
+impl TlsReloadOutcome {
+    pub const ALL: [Self; 2] = [Self::Success, Self::Rejected];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
 /// Detects projected TLS material changes through directory notifications with polling fallback.
 pub struct TlsMaterialChangeDetector {
     watcher: Option<RecommendedWatcher>,
@@ -251,50 +287,23 @@ impl fmt::Debug for ServerIdentityReloader {
     }
 }
 
-/// Provides the most recently validated client trust bundle to connection owners.
-#[derive(Clone, Debug)]
-pub struct ClientTrustProvider {
-    current: tokio::sync::watch::Sender<Vec<u8>>,
-}
-
-impl ClientTrustProvider {
-    /// Returns a snapshot of the active trust bundle PEM.
-    pub fn current_pem(&self) -> Vec<u8> {
-        self.current.borrow().clone()
-    }
-
-    /// Subscribes to valid trust-bundle replacements.
-    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Vec<u8>> {
-        self.current.subscribe()
-    }
-}
-
-/// Reloads a trust bundle while retaining and publishing the last valid generation.
+/// Reloads a trust bundle while retaining the last valid generation.
 #[derive(Clone, Debug)]
 pub struct ClientTrustReloader {
     trust_path: PathBuf,
     current: Vec<u8>,
-    updates: tokio::sync::watch::Sender<Vec<u8>>,
     last_rejected_fingerprint: Option<u64>,
 }
 
 impl ClientTrustReloader {
     /// Loads and validates the initial trust bundle from `trust_path`.
-    pub fn load(trust_path: PathBuf) -> Result<(Self, ClientTrustProvider)> {
+    pub fn load(trust_path: PathBuf) -> Result<Self> {
         let current = read_trust_bundle(&trust_path)?;
-        let (updates, _) = tokio::sync::watch::channel(current.clone());
-        let provider = ClientTrustProvider {
-            current: updates.clone(),
-        };
-        Ok((
-            Self {
-                trust_path,
-                current,
-                updates,
-                last_rejected_fingerprint: None,
-            },
-            provider,
-        ))
+        Ok(Self {
+            trust_path,
+            current,
+            last_rejected_fingerprint: None,
+        })
     }
 
     /// Creates a directory watcher with periodic reconciliation for this trust bundle.
@@ -303,15 +312,6 @@ impl ClientTrustReloader {
         reconciliation_interval: Duration,
     ) -> Result<TlsMaterialChangeDetector> {
         TlsMaterialChangeDetector::new(&[&self.trust_path], reconciliation_interval)
-    }
-
-    /// Validates and publishes a changed trust bundle.
-    pub fn reload_if_changed(&mut self) -> Result<bool> {
-        let Some(candidate) = self.load_candidate()? else {
-            return Ok(false);
-        };
-        self.commit(candidate);
-        Ok(true)
     }
 
     /// Loads a changed, validated trust bundle without changing active state.
@@ -333,10 +333,9 @@ impl ClientTrustReloader {
         Ok((candidate != self.current).then_some(candidate))
     }
 
-    /// Publishes a candidate after the connection owner activates it.
+    /// Records a candidate after the connection owner activates it.
     pub fn commit(&mut self, candidate: Vec<u8>) {
-        self.current = candidate.clone();
-        self.updates.send_replace(candidate);
+        self.current = candidate;
     }
 
     /// Returns a snapshot of the active last-known-good trust bundle.
@@ -368,15 +367,6 @@ impl ServerIdentityReloader {
     /// Returns the active last-known-good identity.
     pub fn current_identity(&self) -> &ServerTlsIdentity {
         &self.current
-    }
-
-    /// Loads a complete replacement generation and returns it only when its contents changed.
-    pub fn reload_if_changed(&mut self) -> Result<Option<ServerTlsIdentity>> {
-        let Some(candidate) = self.load_candidate()? else {
-            return Ok(None);
-        };
-        self.commit(candidate.clone());
-        Ok(Some(candidate))
     }
 
     /// Loads a changed, validated identity without changing active state.
@@ -442,21 +432,6 @@ fn read_server_identity(cert_path: &Path, key_path: &Path) -> Result<ServerTlsId
     build_quic_server_config(&identity, Vec::new()).context("invalid TLS server identity")?;
     validate_server_identity_time(&identity)?;
     Ok(identity)
-}
-
-/// Parses and returns the validity window of a provided server identity.
-pub fn server_identity_validity(
-    identity: &ServerTlsIdentity,
-) -> Result<Option<CertificateValidity>> {
-    let ServerTlsIdentity::Provided { cert_pem, .. } = identity else {
-        return Ok(None);
-    };
-    let leaf = rustls_pemfile::certs(&mut &**cert_pem)
-        .next()
-        .transpose()
-        .context("failed to parse TLS leaf certificate PEM")?
-        .context("no certificate found in TLS PEM")?;
-    parse_certificate_validity(leaf.as_ref()).map(Some)
 }
 
 /// Returns the validity window shared by every certificate in the served chain.
@@ -715,71 +690,6 @@ fn read_trust_bundle(path: &Path) -> Result<Vec<u8>> {
     Ok(trust_pem)
 }
 
-/// Watches projected certificate and key files and updates new QUIC handshakes in place.
-pub async fn run_quic_server_identity_reloader(
-    mut reloader: ServerIdentityReloader,
-    endpoint: quinn::Endpoint,
-    alpn_protocols: Vec<Vec<u8>>,
-    reconciliation_interval: Duration,
-    shutdown: tokio_util::sync::CancellationToken,
-) -> Result<()> {
-    let mut changes = reloader.change_detector(reconciliation_interval)?;
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => return Ok(()),
-            _ = changes.changed() => {
-                match reloader.reload_quic_server_config_if_changed(
-                    &endpoint,
-                    alpn_protocols.clone(),
-                ) {
-                    Ok(true) => tracing::info!(
-                        material_type = "server_identity",
-                        result = "success",
-                        "TLS material reloaded"
-                    ),
-                    Ok(false) => {}
-                    Err(error) => tracing::warn!(
-                        material_type = "server_identity",
-                        result = "rejected",
-                        error = %error,
-                        "TLS material reload rejected; retaining last-known-good configuration"
-                    ),
-                }
-            }
-        }
-    }
-}
-
-/// Watches a projected trust-bundle file and publishes valid replacements.
-pub async fn run_client_trust_reloader(
-    mut reloader: ClientTrustReloader,
-    reconciliation_interval: Duration,
-    shutdown: tokio_util::sync::CancellationToken,
-) -> Result<()> {
-    let mut changes = reloader.change_detector(reconciliation_interval)?;
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => return Ok(()),
-            _ = changes.changed() => {
-                match reloader.reload_if_changed() {
-                    Ok(true) => tracing::info!(
-                        material_type = "client_trust",
-                        result = "success",
-                        "TLS material reloaded"
-                    ),
-                    Ok(false) => {}
-                    Err(error) => tracing::warn!(
-                        material_type = "client_trust",
-                        result = "rejected",
-                        error = %error,
-                        "TLS material reload rejected; retaining last-known-good configuration"
-                    ),
-                }
-            }
-        }
-    }
-}
-
 /// Builds a QUIC client config that skips server certificate verification.
 pub fn build_insecure_quic_client_config() -> Result<ClientConfig> {
     build_insecure_quic_client_config_with_alpn(Vec::new())
@@ -924,6 +834,7 @@ mod tests {
     use super::*;
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+    static WATCHER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct TestDir(PathBuf);
 
@@ -944,6 +855,18 @@ mod tests {
     impl Drop for TestDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn reconciliation_only_detector(interval: Duration) -> TlsMaterialChangeDetector {
+        let (_events_tx, events) = tokio::sync::mpsc::channel(1);
+        let mut reconciliation = tokio::time::interval(interval);
+        reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        TlsMaterialChangeDetector {
+            watcher: None,
+            events,
+            reconciliation,
+            pending_change_deadline: None,
         }
     }
 
@@ -1015,8 +938,8 @@ mod tests {
         install_projected_generation(root.path(), "..2026_02", &second_cert, &second_key);
 
         let replacement = reloader
-            .reload_if_changed()
-            .expect("reload projected identity")
+            .load_candidate()
+            .expect("load projected identity")
             .expect("replacement should be detected");
         assert_eq!(
             replacement,
@@ -1025,6 +948,7 @@ mod tests {
                 key_pem: second_key.clone(),
             }
         );
+        reloader.commit(replacement);
         assert_eq!(
             reloader.current_identity(),
             &ServerTlsIdentity::Provided {
@@ -1075,116 +999,117 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn server_identity_watch_rejects_invalid_generation_then_activates_valid_generation()
+    async fn server_identity_reconciliation_rejects_invalid_then_activates_valid_generation()
     -> Result<()> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let root = TestDir::new();
         let (first_cert, first_key) = generate_self_signed_cert().unwrap();
         let (second_cert, second_key) = generate_self_signed_cert().unwrap();
         install_projected_generation(root.path(), "..2026_01", &first_cert, &first_key);
-        let reloader =
+        let mut reloader =
             ServerIdentityReloader::load(root.path().join("tls.crt"), root.path().join("tls.key"))?;
         let initial_config = build_quic_server_config(reloader.current_identity(), Vec::new())?;
         let server = quinn::Endpoint::server(initial_config, "127.0.0.1:0".parse().unwrap())?;
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let watcher = tokio::spawn(run_quic_server_identity_reloader(
-            reloader,
-            server.clone(),
-            Vec::new(),
-            std::time::Duration::from_secs(60),
-            shutdown.clone(),
-        ));
+        let mut changes = reconciliation_only_detector(Duration::from_millis(10));
+        changes.changed().await;
 
         install_projected_generation(root.path(), "..2026_bad", &second_cert, &first_key);
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::timeout(Duration::from_secs(5), changes.changed())
+            .await
+            .context("invalid projected generation was not observed")?;
+        assert!(reloader.load_candidate().is_err());
         connect_with_trust(&server, &first_cert).await?;
         assert!(connect_with_trust(&server, &second_cert).await.is_err());
 
         install_projected_generation(root.path(), "..2026_02", &second_cert, &second_key);
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if connect_with_trust(&server, &second_cert).await.is_ok() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .context("valid replacement was not activated")?;
-
-        shutdown.cancel();
-        watcher.await??;
+        tokio::time::timeout(Duration::from_secs(5), changes.changed())
+            .await
+            .context("valid projected generation was not observed")?;
+        let replacement = reloader
+            .load_candidate()?
+            .context("valid replacement was not loaded")?;
+        server.set_server_config(Some(build_quic_server_config(&replacement, Vec::new())?));
+        reloader.commit(replacement);
+        connect_with_trust(&server, &second_cert).await?;
+        assert!(connect_with_trust(&server, &first_cert).await.is_err());
         Ok(())
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn client_trust_reloader_publishes_only_valid_projected_updates() -> Result<()> {
+    async fn client_trust_reconciliation_retains_only_valid_projected_updates() -> Result<()> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let root = TestDir::new();
         let (first_cert, _) = generate_self_signed_cert().unwrap();
         let (second_cert, _) = generate_self_signed_cert().unwrap();
         install_projected_trust_generation(root.path(), "..2026_01", &first_cert);
 
-        let (reloader, provider) = ClientTrustReloader::load(root.path().join("ca.crt"))?;
-        let mut updates = provider.subscribe();
-        assert_eq!(provider.current_pem(), first_cert);
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let watcher = tokio::spawn(run_client_trust_reloader(
-            reloader,
-            Duration::from_millis(10),
-            shutdown.clone(),
-        ));
+        let mut reloader = ClientTrustReloader::load(root.path().join("ca.crt"))?;
+        let mut changes = reconciliation_only_detector(Duration::from_millis(10));
+        changes.changed().await;
+        assert_eq!(reloader.current_pem(), first_cert);
 
         install_projected_trust_generation(root.path(), "..2026_bad", b"");
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(provider.current_pem(), first_cert);
-        assert!(!updates.has_changed()?);
+        tokio::time::timeout(Duration::from_secs(5), changes.changed())
+            .await
+            .context("invalid trust generation was not observed")?;
+        assert!(reloader.load_candidate().is_err());
+        assert_eq!(reloader.current_pem(), first_cert);
 
         install_projected_trust_generation(root.path(), "..2026_02", &second_cert);
-        tokio::time::timeout(Duration::from_secs(1), updates.changed())
+        tokio::time::timeout(Duration::from_secs(5), changes.changed())
             .await
-            .context("valid trust replacement was not published")??;
-        assert_eq!(provider.current_pem(), second_cert);
-
-        shutdown.cancel();
-        watcher.await??;
+            .context("valid trust generation was not observed")?;
+        let replacement = reloader
+            .load_candidate()?
+            .context("valid trust replacement was not loaded")?;
+        reloader.commit(replacement);
+        assert_eq!(reloader.current_pem(), second_cert);
         Ok(())
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn client_trust_directory_event_beats_slow_reconciliation_poll() -> Result<()> {
+        let _watcher_test = WATCHER_TEST_LOCK.lock().await;
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let root = TestDir::new();
         let (first_cert, _) = generate_self_signed_cert().unwrap();
         let (second_cert, _) = generate_self_signed_cert().unwrap();
         install_projected_trust_generation(root.path(), "..2026_01", &first_cert);
 
-        let (reloader, provider) = ClientTrustReloader::load(root.path().join("ca.crt"))?;
-        let mut updates = provider.subscribe();
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let watcher = tokio::spawn(run_client_trust_reloader(
-            reloader,
-            Duration::from_secs(60),
-            shutdown.clone(),
-        ));
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut reloader = ClientTrustReloader::load(root.path().join("ca.crt"))?;
+        let (events_tx, events) = tokio::sync::mpsc::channel(1);
+        let watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {})?;
+        let mut reconciliation = tokio::time::interval(Duration::from_secs(60));
+        reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut changes = TlsMaterialChangeDetector {
+            watcher: Some(watcher),
+            events,
+            reconciliation,
+            pending_change_deadline: None,
+        };
+        changes.changed().await;
         install_projected_trust_generation(root.path(), "..2026_02", &second_cert);
-
-        tokio::time::timeout(Duration::from_secs(5), updates.changed())
+        events_tx
+            .send(Ok(notify::Event::new(notify::EventKind::Any)))
             .await
-            .context("directory event did not trigger trust reload before fallback poll")??;
-        assert_eq!(provider.current_pem(), second_cert);
+            .context("send directory change event")?;
 
-        shutdown.cancel();
-        watcher.await??;
+        tokio::time::timeout(Duration::from_secs(5), changes.changed())
+            .await
+            .context("directory event did not arrive before fallback poll")?;
+        let replacement = reloader
+            .load_candidate()?
+            .context("directory event did not expose the trust replacement")?;
+        reloader.commit(replacement);
+        assert_eq!(reloader.current_pem(), second_cert);
         Ok(())
     }
 
     #[tokio::test]
     async fn change_detector_reconciles_when_directory_watch_is_unavailable() -> Result<()> {
+        let _watcher_test = WATCHER_TEST_LOCK.lock().await;
         let root = TestDir::new();
         let missing_material = root.path().join("missing").join("tls.crt");
         let mut detector =
@@ -1199,6 +1124,7 @@ mod tests {
 
     #[tokio::test]
     async fn change_detector_retains_event_when_debounce_wait_is_cancelled() -> Result<()> {
+        let _watcher_test = WATCHER_TEST_LOCK.lock().await;
         let (events_tx, events) = tokio::sync::mpsc::channel(1);
         let watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {})?;
         let mut reconciliation = tokio::time::interval(Duration::from_secs(60));
@@ -1295,16 +1221,6 @@ mod tests {
             .unwrap();
         let chain_pem = format!("{}{}", leaf.pem(), issuer.pem()).into_bytes();
         let key_pem = leaf_key.serialize_pem().into_bytes();
-        let identity = ServerTlsIdentity::Provided {
-            cert_pem: chain_pem.clone(),
-            key_pem: key_pem.clone(),
-        };
-        let leaf_validity = server_identity_validity(&identity).unwrap().unwrap();
-        let effective_validity = server_identity_effective_validity(&identity)
-            .unwrap()
-            .unwrap();
-        assert!(effective_validity.not_after_unix_seconds < leaf_validity.not_after_unix_seconds);
-
         fs::write(&cert_path, chain_pem).unwrap();
         fs::write(&key_path, key_pem).unwrap();
 
@@ -1334,7 +1250,7 @@ mod tests {
         let trust_path = root.path().join("ca.crt");
         let (initial_cert, _) = generate_self_signed_cert().unwrap();
         fs::write(&trust_path, &initial_cert).unwrap();
-        let (mut reloader, _) = ClientTrustReloader::load(trust_path.clone()).unwrap();
+        let mut reloader = ClientTrustReloader::load(trust_path.clone()).unwrap();
 
         fs::write(&trust_path, b"invalid trust generation").unwrap();
         assert!(reloader.load_candidate().is_err());

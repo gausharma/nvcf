@@ -149,7 +149,10 @@ pub async fn start_quic_http_tunnel(
                             .ok()
                             .flatten();
                             if let Some(metrics) = &metrics {
-                                metrics.observe_tls_reload("server_identity", "success");
+                                metrics.observe_tls_reload(
+                                    stargate_tls::TlsMaterial::ServerIdentity,
+                                    stargate_tls::TlsReloadOutcome::Success,
+                                );
                                 if let Some(validity) = validity {
                                     metrics.set_tls_certificate_expiry(
                                         validity.not_after_unix_seconds,
@@ -168,7 +171,10 @@ pub async fn start_quic_http_tunnel(
                         Ok(false) => {}
                         Err(error) => {
                             if let Some(metrics) = &metrics {
-                                metrics.observe_tls_reload("server_identity", "rejected");
+                                metrics.observe_tls_reload(
+                                    stargate_tls::TlsMaterial::ServerIdentity,
+                                    stargate_tls::TlsReloadOutcome::Rejected,
+                                );
                             }
                             tracing::warn!(
                                 component = "pylon",

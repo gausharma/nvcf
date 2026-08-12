@@ -1800,7 +1800,7 @@ async fn direct_client_reloads_trust_and_closes_existing_connections() {
     let tls_dir = tempfile::tempdir().unwrap();
     let trust_path = tls_dir.path().join("ca.crt");
     std::fs::write(&trust_path, &first_cert).unwrap();
-    let (reloader, _) = stargate_tls::ClientTrustReloader::load(trust_path.clone()).unwrap();
+    let reloader = stargate_tls::ClientTrustReloader::load(trust_path.clone()).unwrap();
     let proxy = test_quic_proxy_with(Default::default(), |config| {
         config.tls_cert_pem = Some(first_cert.clone());
         config.quic_insecure = false;

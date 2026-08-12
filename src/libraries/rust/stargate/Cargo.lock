@@ -3492,7 +3492,6 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "tokio",
- "tokio-util",
  "tracing",
 ]
 

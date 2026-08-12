@@ -29,9 +29,8 @@ use pylon_lib::{
     PylonQueueMismatchRetryConfig, PylonRetryConfig, PylonRuntimeState, QuicHttpTunnelConfig,
     QuicHttpTunnelHandle, RequestQualityMonitorConfig, StatsCollectorConfig, StatsCollectorHandle,
     TunnelForwardingConfig, UpstreamBackend, start_engine_stats_stream,
-    start_metrics_server_with_readiness,
-    start_model_lifecycle, start_quic_http_tunnel, start_stats_collector_with_engine_stats,
-    stats_aggregator_update_channel,
+    start_metrics_server_with_readiness, start_model_lifecycle, start_quic_http_tunnel,
+    start_stats_collector_with_engine_stats, stats_aggregator_update_channel,
 };
 use reqwest::header::HeaderName;
 use stargate_proto::pb::InferenceServerStatus;
@@ -276,18 +275,27 @@ impl RunningPylon {
                                 Ok(()) => {
                                     reloader.commit(candidate);
                                     self.registration_config = Some(replacement);
-                                    self.metrics.observe_tls_reload("client_trust", "success");
+                                    self.metrics.observe_tls_reload(
+                                        stargate_tls::TlsMaterial::ClientTrust,
+                                        stargate_tls::TlsReloadOutcome::Success,
+                                    );
                                     info!(component = "pylon", material_type = "client_trust", result = "success", "TLS material reloaded; restarted registration session");
                                 }
                                 Err(error) => {
-                                    self.metrics.observe_tls_reload("client_trust", "rejected");
+                                    self.metrics.observe_tls_reload(
+                                        stargate_tls::TlsMaterial::ClientTrust,
+                                        stargate_tls::TlsReloadOutcome::Rejected,
+                                    );
                                     warn!(component = "pylon", material_type = "client_trust", result = "rejected", %error, "TLS material activation rejected; retaining last-known-good registration session");
                                 }
                             }
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            self.metrics.observe_tls_reload("client_trust", "rejected");
+                            self.metrics.observe_tls_reload(
+                                stargate_tls::TlsMaterial::ClientTrust,
+                                stargate_tls::TlsReloadOutcome::Rejected,
+                            );
                             warn!(component = "pylon", material_type = "client_trust", result = "rejected", %error, "TLS material reload rejected; retaining last-known-good configuration");
                         }
                     }
@@ -420,7 +428,7 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
                 .tls_cert_path
                 .as_ref()
                 .context("--tls-cert-path is required for secure reverse tunnels")?;
-            let (reloader, _) = stargate_tls::ClientTrustReloader::load(trust_path.into())
+            let reloader = stargate_tls::ClientTrustReloader::load(trust_path.into())
                 .context("load initial Pylon TLS client trust")?;
             let current_pem = reloader.current_pem().to_vec();
             let changes = reloader.change_detector(stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL)?;

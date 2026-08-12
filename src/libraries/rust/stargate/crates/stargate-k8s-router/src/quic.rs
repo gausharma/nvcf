@@ -152,18 +152,27 @@ impl QuicRouterRuntime {
                                         self.endpoint.set_server_config(Some(server_config));
                                         reloader.commit(identity);
                                         metrics.set_tls_certificate_expiry(validity.not_after_unix_seconds);
-                                        metrics.observe_tls_reload("server_identity", "success");
+                                        metrics.observe_tls_reload(
+                                            stargate_tls::TlsMaterial::ServerIdentity,
+                                            stargate_tls::TlsReloadOutcome::Success,
+                                        );
                                         info!(component = "stargate-k8s-router", material_type = "server_identity", result = "success", not_before_unix_seconds = validity.not_before_unix_seconds, not_after_unix_seconds = validity.not_after_unix_seconds, "TLS material reloaded");
                                     }
                                     Err(error) => {
-                                        metrics.observe_tls_reload("server_identity", "rejected");
+                                        metrics.observe_tls_reload(
+                                            stargate_tls::TlsMaterial::ServerIdentity,
+                                            stargate_tls::TlsReloadOutcome::Rejected,
+                                        );
                                         warn!(component = "stargate-k8s-router", material_type = "server_identity", result = "rejected", %error, "TLS material activation rejected; retaining last-known-good configuration");
                                     }
                                 }
                             }
                             Ok(None) => {}
                             Err(error) => {
-                                metrics.observe_tls_reload("server_identity", "rejected");
+                                metrics.observe_tls_reload(
+                                    stargate_tls::TlsMaterial::ServerIdentity,
+                                    stargate_tls::TlsReloadOutcome::Rejected,
+                                );
                                 warn!(component = "stargate-k8s-router", material_type = "server_identity", result = "rejected", %error, "TLS material reload rejected; retaining last-known-good configuration");
                             }
                         }
@@ -181,18 +190,27 @@ impl QuicRouterRuntime {
                                     Ok(previous) => {
                                         reloader.commit(candidate);
                                         previous.close(b"TLS trust configuration replaced");
-                                        metrics.observe_tls_reload("client_trust", "success");
+                                        metrics.observe_tls_reload(
+                                            stargate_tls::TlsMaterial::ClientTrust,
+                                            stargate_tls::TlsReloadOutcome::Success,
+                                        );
                                         info!(component = "stargate-k8s-router", material_type = "client_trust", result = "success", "TLS material reloaded; existing upstream connections closed");
                                     }
                                     Err(error) => {
-                                        metrics.observe_tls_reload("client_trust", "rejected");
+                                        metrics.observe_tls_reload(
+                                            stargate_tls::TlsMaterial::ClientTrust,
+                                            stargate_tls::TlsReloadOutcome::Rejected,
+                                        );
                                         warn!(component = "stargate-k8s-router", material_type = "client_trust", result = "rejected", %error, "TLS material activation rejected; retaining last-known-good configuration");
                                     }
                                 }
                             }
                             Ok(None) => {}
                             Err(error) => {
-                                metrics.observe_tls_reload("client_trust", "rejected");
+                                metrics.observe_tls_reload(
+                                    stargate_tls::TlsMaterial::ClientTrust,
+                                    stargate_tls::TlsReloadOutcome::Rejected,
+                                );
                                 warn!(component = "stargate-k8s-router", material_type = "client_trust", result = "rejected", %error, "TLS material reload rejected; retaining last-known-good configuration");
                             }
                         }
@@ -828,7 +846,7 @@ mod tests {
                 if connects(router_addr, server_name, &second_cert).await {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await

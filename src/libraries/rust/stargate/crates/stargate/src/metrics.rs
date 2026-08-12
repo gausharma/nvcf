@@ -29,6 +29,8 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+use stargate_tls::{TlsMaterial, TlsReloadOutcome};
+
 pub const DEFAULT_PREFIX: &str = "stargate_";
 
 macro_rules! define_stargate_metrics {
@@ -141,11 +143,11 @@ impl StargateMetrics {
 
     pub fn new_with_prefix(prefix: &str) -> anyhow::Result<Arc<Self>> {
         let metrics = Arc::new(Self::register(prefix)?);
-        for material_type in ["server_identity", "client_trust"] {
-            for result in ["success", "rejected"] {
+        for material in TlsMaterial::ALL {
+            for outcome in TlsReloadOutcome::ALL {
                 metrics
                     .tls_reloads_total
-                    .with_label_values(&[material_type, result])
+                    .with_label_values(&[material.as_str(), outcome.as_str()])
                     .inc_by(0);
             }
         }
@@ -172,7 +174,7 @@ impl StargateMetrics {
         GenericCounter<AtomicU64>, admission_rejections_total(routing_key: Option<&str>, model: &str, reason: &str) => [routing_key.unwrap_or(""), model, reason];
         GenericCounter<AtomicU64>, quic_connection_evictions_total(inference_server_id: &str, reason: &str) => [inference_server_id, reason];
         GenericCounter<AtomicU64>, quic_hot_path_reconnect_total(inference_server_id: &str, result: &str) => [inference_server_id, result];
-        GenericCounter<AtomicU64>, tls_reloads_total(material_type: &str, result: &str) => [material_type, result];
+        GenericCounter<AtomicU64>, tls_reloads_total(material: TlsMaterial, outcome: TlsReloadOutcome) => [material.as_str(), outcome.as_str()];
         Histogram, proxy_replay_buffer_bytes(model: &str) => [model];
         Histogram, proxy_duration_seconds(routing_key: Option<&str>, model: &str, inference_server_id: &str) => [routing_key.unwrap_or(""), model, inference_server_id];
         Histogram, routing_duration_seconds(routing_key: Option<&str>, model: &str) => [routing_key.unwrap_or(""), model];
@@ -323,7 +325,10 @@ mod tests {
     fn tls_reload_metrics_are_preinitialized() {
         let metrics = StargateMetrics::new().expect("metrics should initialize");
         metrics
-            .tls_reloads_total("server_identity", "success")
+            .tls_reloads_total(
+                stargate_tls::TlsMaterial::ServerIdentity,
+                stargate_tls::TlsReloadOutcome::Success,
+            )
             .inc();
         metrics.set_tls_certificate_expiry(1_800_000_000);
         let body = metrics.gather_text().expect("metrics should encode");

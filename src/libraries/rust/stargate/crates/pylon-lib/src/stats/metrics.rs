@@ -31,6 +31,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use stargate_proto::pb::InferenceServerStatus;
+use stargate_tls::{TlsMaterial, TlsReloadOutcome};
 
 use crate::queue_admission::{ObservedRequestState, RequestObservationTransition};
 use crate::{CurrentModelStats, RequestObservation, RequestObservationState};
@@ -111,10 +112,10 @@ macro_rules! metrics {
                     tls_identity_not_after: AtomicI64::new(i64::MAX),
                     $($($field,)*)*
                 });
-                for material_type in ["server_identity", "client_trust"] {
-                    for result in ["success", "rejected"] {
+                for material in TlsMaterial::ALL {
+                    for outcome in TlsReloadOutcome::ALL {
                         metrics.tls_reloads_total
-                            .with_label_values(&[material_type, result])
+                            .with_label_values(&[material.as_str(), outcome.as_str()])
                             .inc_by(0);
                     }
                 }
@@ -222,9 +223,9 @@ macro_rules! metric_observer {
 }
 
 impl PylonMetrics {
-    pub fn observe_tls_reload(&self, material_type: &str, result: &str) {
+    pub fn observe_tls_reload(&self, material: TlsMaterial, outcome: TlsReloadOutcome) {
         self.tls_reloads_total
-            .with_label_values(&[material_type, result])
+            .with_label_values(&[material.as_str(), outcome.as_str()])
             .inc();
     }
 
@@ -721,7 +722,10 @@ mod tests {
     fn tls_reload_metrics_are_preinitialized() {
         let metrics = PylonMetrics::new().expect("metrics should initialize");
         assert!(!metrics.tls_identity_is_ready());
-        metrics.observe_tls_reload("client_trust", "success");
+        metrics.observe_tls_reload(
+            stargate_tls::TlsMaterial::ClientTrust,
+            stargate_tls::TlsReloadOutcome::Success,
+        );
         metrics.set_tls_certificate_expiry(1_800_000_000);
         assert!(!metrics.tls_identity_is_ready());
         metrics.mark_tls_initial_validation_complete();

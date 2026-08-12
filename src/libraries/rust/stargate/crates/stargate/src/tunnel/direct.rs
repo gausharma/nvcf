@@ -166,13 +166,23 @@ impl QuicHttpProxy {
                                     reloader.commit(candidate);
                                     previous.close();
                                     if let Some(metrics) = self.metrics.get() {
-                                        metrics.tls_reloads_total("client_trust", "success").inc();
+                                        metrics
+                                            .tls_reloads_total(
+                                                stargate_tls::TlsMaterial::ClientTrust,
+                                                stargate_tls::TlsReloadOutcome::Success,
+                                            )
+                                            .inc();
                                     }
                                     tracing::info!(component = "stargate", material_type = "client_trust", result = "success", "TLS material reloaded; existing client connections closed");
                                 }
                                 Err(error) => {
                                     if let Some(metrics) = self.metrics.get() {
-                                        metrics.tls_reloads_total("client_trust", "rejected").inc();
+                                        metrics
+                                            .tls_reloads_total(
+                                                stargate_tls::TlsMaterial::ClientTrust,
+                                                stargate_tls::TlsReloadOutcome::Rejected,
+                                            )
+                                            .inc();
                                     }
                                     tracing::warn!(component = "stargate", material_type = "client_trust", result = "rejected", error = %error, "TLS material activation rejected; retaining last-known-good configuration");
                                 }
@@ -180,7 +190,12 @@ impl QuicHttpProxy {
                         }
                         Err(error) => {
                             if let Some(metrics) = self.metrics.get() {
-                                metrics.tls_reloads_total("client_trust", "rejected").inc();
+                                metrics
+                                    .tls_reloads_total(
+                                        stargate_tls::TlsMaterial::ClientTrust,
+                                        stargate_tls::TlsReloadOutcome::Rejected,
+                                    )
+                                    .inc();
                             }
                             tracing::warn!(
                                 component = "stargate",

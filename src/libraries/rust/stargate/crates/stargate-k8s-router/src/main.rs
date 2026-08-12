@@ -123,10 +123,7 @@ impl RouterStartupConfig {
         } else {
             args.tls_cert_path
                 .as_ref()
-                .map(|path| {
-                    stargate_tls::ClientTrustReloader::load(path.into())
-                        .map(|(reloader, _)| reloader)
-                })
+                .map(|path| stargate_tls::ClientTrustReloader::load(path.into()))
                 .transpose()?
         };
         let tls_cert_pem = server_identity_reloader.as_ref().and_then(|reloader| {
@@ -178,10 +175,7 @@ impl RouterStartupConfig {
                 } else {
                     args.upstream_tls_cert_path
                         .as_ref()
-                        .map(|path| {
-                            stargate_tls::ClientTrustReloader::load(path.into())
-                                .map(|(reloader, _)| reloader)
-                        })
+                        .map(|path| stargate_tls::ClientTrustReloader::load(path.into()))
                         .transpose()?
                 };
                 let upstream_tls_cert_pem = client_trust_reloader
