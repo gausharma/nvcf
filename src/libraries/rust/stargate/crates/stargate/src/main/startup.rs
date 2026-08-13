@@ -99,6 +99,9 @@ fn validate_backend_connectivity_args(args: &Args) -> Result<()> {
 
 pub(super) fn proxy_transport_config_from_args(args: &Args) -> Result<ProxyTransportConfig> {
     let retry = proxy_retry_config_from_args(args)?;
+    if args.tls_cert_path.is_none() && args.tls_key_path.is_some() {
+        anyhow::bail!("TLS cert path is required when TLS key path is provided");
+    }
     let server_identity_reloader = if args.reverse_tunnel_listen_addr.is_some() {
         match (&args.tls_cert_path, &args.tls_key_path) {
             (Some(cert_path), Some(key_path)) => Some(ServerIdentityReloader::load(

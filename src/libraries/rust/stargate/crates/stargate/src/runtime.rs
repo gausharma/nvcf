@@ -290,13 +290,12 @@ impl StargateRuntime {
         );
 
         let (tasks, critical_failure_rx) = CriticalTaskGroup::new("stargate");
-        if self.reverse_tunnel.is_none()
-            && let Some(reloader) = self
-                .config
-                .proxy_transport
-                .quic
-                .client_trust_reloader
-                .clone()
+        if let Some(reloader) = self
+            .config
+            .proxy_transport
+            .quic
+            .client_trust_reloader
+            .clone()
         {
             let proxy = quic_proxy.clone();
             let poll_interval = self.config.proxy_transport.quic.tls_reload_interval;

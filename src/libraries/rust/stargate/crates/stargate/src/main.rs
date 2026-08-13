@@ -786,6 +786,20 @@ mod tests {
     }
 
     #[test]
+    fn tls_key_path_requires_tls_cert_path_without_reverse_listener() {
+        let key = tempfile::NamedTempFile::new().expect("key file should be creatable");
+        let path = key.path().to_str().expect("key path should be UTF-8");
+        let args = try_parse_argv(["--tls-key-path", path]).expect("key path should parse");
+
+        let err = proxy_transport_config_from_args(&args)
+            .expect_err("TLS key without certificate must be rejected");
+        assert_error_contains(
+            &err,
+            "TLS cert path is required when TLS key path is provided",
+        );
+    }
+
+    #[test]
     fn reverse_listener_tls_cert_still_requires_server_key() {
         let cert = tempfile::NamedTempFile::new().expect("cert file should be creatable");
         let path = cert.path().to_str().expect("cert path should be UTF-8");

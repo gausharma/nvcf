@@ -707,7 +707,7 @@ pub async fn start_metrics_server_with_readiness(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use stargate_proto::pb::InferenceServerStatus;
 
@@ -726,7 +726,14 @@ mod tests {
             stargate_tls::TlsMaterial::ClientTrust,
             stargate_tls::TlsReloadOutcome::Success,
         );
-        metrics.set_tls_certificate_expiry(1_800_000_000);
+        let future_expiry = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_secs()
+            .saturating_add(60)
+            .try_into()
+            .expect("future expiry should fit in i64");
+        metrics.set_tls_certificate_expiry(future_expiry);
         assert!(!metrics.tls_identity_is_ready());
         metrics.mark_tls_initial_validation_complete();
         let body = metrics.gather_text().expect("metrics should encode");
@@ -738,7 +745,9 @@ mod tests {
             r#"pylon_tls_reloads_total{material_type="server_identity",result="rejected"} 0"#
         ));
         assert!(body.contains(
-            r#"pylon_tls_certificate_expiry_seconds{material_type="server_identity"} 1800000000"#
+            &format!(
+                r#"pylon_tls_certificate_expiry_seconds{{material_type="server_identity"}} {future_expiry}"#
+            )
         ));
         assert!(metrics.tls_identity_is_ready());
         metrics.set_tls_certificate_expiry(0);

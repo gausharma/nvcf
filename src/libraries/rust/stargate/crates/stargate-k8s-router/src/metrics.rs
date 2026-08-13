@@ -176,11 +176,18 @@ mod tests {
             stargate_tls::TlsMaterial::ServerIdentity,
             stargate_tls::TlsReloadOutcome::Success,
         );
-        metrics.set_tls_certificate_expiry(1_800_000_000);
+        let future_expiry: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_secs()
+            .saturating_add(60)
+            .try_into()
+            .expect("future expiry should fit in i64");
+        metrics.set_tls_certificate_expiry(future_expiry);
         let body = metrics.gather().expect("metrics should encode");
 
         assert!(body.contains(r#"stargate_k8s_router_tls_reloads_total{material_type="server_identity",result="success"} 1"#));
         assert!(body.contains(r#"stargate_k8s_router_tls_reloads_total{material_type="client_trust",result="rejected"} 0"#));
-        assert!(body.contains(r#"stargate_k8s_router_tls_certificate_expiry_seconds{material_type="server_identity"} 1800000000"#));
+        assert!(body.contains(&format!(r#"stargate_k8s_router_tls_certificate_expiry_seconds{{material_type="server_identity"}} {future_expiry}"#)));
     }
 }

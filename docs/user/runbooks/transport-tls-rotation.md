@@ -52,8 +52,8 @@ symlink exposes one complete generation.
 Check the projected generation inside each pod:
 
 ```bash
-kubectl exec -n <namespace> <pod> -- readlink -f <tls-mount>/tls.crt
-kubectl exec -n <namespace> <pod> -- readlink -f <tls-mount>/tls.key
+kubectl exec -n <namespace> <pod> -- readlink -f <tls-mount>/<tls.certPath>
+kubectl exec -n <namespace> <pod> -- readlink -f <tls-mount>/<tls.keyPath>
 ```
 
 Check reload counters and the active server certificate expiry:

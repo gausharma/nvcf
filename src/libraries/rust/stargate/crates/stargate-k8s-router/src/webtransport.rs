@@ -281,10 +281,6 @@ async fn dispatch_incoming(
     let mut trust_updates = config.trust_generation.subscribe();
     let connection = tokio::select! {
         _ = shutdown.cancelled() => return Ok(()),
-        changed = trust_updates.changed() => {
-            changed.context("TLS trust generation channel closed")?;
-            return Ok(());
-        }
         connection = incoming => connection.context("accept downstream QUIC connection")?,
     };
     let route = {
@@ -321,6 +317,7 @@ async fn dispatch_incoming(
         }
         changed = trust_updates.changed() => {
             changed.context("TLS trust generation channel closed")?;
+            metrics.observe_webtransport_session("trust_replaced");
             downstream_connection.close(0u32.into(), b"TLS trust configuration replaced");
             return Ok(());
         }
@@ -353,6 +350,7 @@ async fn dispatch_incoming(
         }
         changed = trust_updates.changed() => {
             changed.context("TLS trust generation channel closed")?;
+            metrics.observe_webtransport_session("trust_replaced");
             downstream_connection.close(0u32.into(), b"TLS trust configuration replaced");
             return Ok(());
         }
@@ -390,6 +388,7 @@ async fn dispatch_incoming(
         }
         changed = trust_updates.changed() => {
             changed.context("TLS trust generation channel closed")?;
+            metrics.observe_webtransport_session("trust_replaced");
             downstream_connection.close(0u32.into(), b"TLS trust configuration replaced");
             return Ok(());
         }
