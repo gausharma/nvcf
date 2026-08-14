@@ -1,9 +1,10 @@
 # Strict Infrastructure-Level Gherkin DSL
 
 This is the complete set of step definitions for `tests/bdd`. Every
-new step must reuse one of these patterns. Step handlers do not contain
-domain-specific validation logic; that lives in Gherkin via CLI invocations
-and output assertions.
+new step must reuse one of these patterns. Shared steps may hide repeated
+command and output-format mechanics, but their Gherkin must keep meaningful
+targets, values, contexts, and timeouts visible. Step handlers do not contain
+domain-specific validation logic.
 
 ## Vocabulary
 
@@ -112,6 +113,8 @@ refactor in every consumer; that is a feature.
 |------|-------|
 | `When I run command {string}` | Single-line command. `${VAR}` expansion applies. Captures exit code + stdout + stderr in scenario state. The most recent run is the one assertions reference. |
 | `When I run command:` (docstring) | Multi-line form for commands that don't fit on one line. Same recording semantics. |
+| `When I successfully run command {string}` | Single-line command that must exit 0. Preserves the command result for later output assertions and records the resolved command in the successful-command cache. |
+| `When I successfully run command:` (docstring) | Multi-line form for commands that must exit 0. Uses the same result recording, interpolation, logging, and cache semantics as the single-line form. |
 | `When I run command with a terminal:` (docstring) | Same as the docstring form, but stdin is attached to a pseudo-terminal so the child sees a TTY on fd 0. For commands that gate interactive-only behavior on a TTY, such as `nvcf-cli self-hosted up` (its auth-gate mints the admin token only when stdin is a terminal). No input is written; stdout and stderr are captured separately as usual. |
 | `When I export command output to environment variable {string}` | Exports the previous command's trimmed stdout under the named env var. Fails the step unless the prior command exited 0 and produced non-empty stdout. Snapshotted by the env Ledger; restored at suite teardown. |
 
@@ -227,10 +230,10 @@ do so via another `When I run command "rm ..."`.
 
 ## Why this list
 
-The promise of the DSL is that any future feature file can be written
-using only these steps. If a new scenario needs something the catalog
-doesn't cover, the right move is almost always to express it as a
-`When I run command` + an output assertion, not to add a new step.
+The promise of the DSL is that any future feature file can be written using
+only these steps. Add a shared step when a repeated action or observable keeps
+its meaningful inputs visible and hides only command or output-format
+mechanics. Otherwise use `When I run command` plus an output assertion.
 
 The infrastructure-bootstrap Givens (cluster up, image pull secret) and
 the single `Given command has succeeded:` carry-over are the only places
